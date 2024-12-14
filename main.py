@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import PyPDF2
@@ -7,10 +8,24 @@ from openai import OpenAI
 import os
 import json
 
+
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),  # This is the default and can be omitted
 )
 app = FastAPI()
+
+# Configure CORS
+origins = [
+    "http://localhost:4200",  # Replace with your Angular app's URL
+    "https://platx.onrender.com/"  # Add your production domain if needed
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class ExamRequest(BaseModel):
     language: str  # "English" or "Arabic"
