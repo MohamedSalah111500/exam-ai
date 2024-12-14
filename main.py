@@ -9,7 +9,7 @@ import os
 import json
 
 client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),  # This is the default and can be omitted
+    api_key="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",  
 )
 app = FastAPI()
 
@@ -37,7 +37,7 @@ async def generate_exam(
         if not text.strip():
             raise HTTPException(status_code=400, detail="Failed to extract text from the PDF.")
 
-        # Prepare the prompt for GPT-4
+        # Prepare the prompt for gpt-3.5-turbo
         prompt = (
                     f"Extract meaningful exam 3 questions and answers from the following text. "
                     f"Make the 3 questions in this language: {language}. "
@@ -56,9 +56,9 @@ async def generate_exam(
                     f"}}"
                     f"Just give me the json format as a response.\n"
                 )
-        # Query GPT-4 for question generation
+        # Query gpt-3.5-turbo for question generation
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are an educational content generator."},
                 {"role": "user", "content": prompt}
