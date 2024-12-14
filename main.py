@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from typing import Optional
 import PyPDF2
 from openai import OpenAI
-
 import os
 import json
 
@@ -24,13 +23,20 @@ async def generate_exam(
     language: str = Form(...),
     level: str = Form(...),
     question_count: str = Form(...),
-
 ):
     # Validate inputs
     if language not in ["English", "Arabic"]:
         raise HTTPException(status_code=400, detail="Invalid language. Use 'English' or 'Arabic'.")
     if level not in ["easy", "medium", "difficult"]:
         raise HTTPException(status_code=400, detail="Invalid level. Use 'easy', 'medium', or 'difficult'.")
+
+    # Validate question_count
+    try:
+        question_count_int = int(question_count)
+        if question_count_int > 10:
+            raise HTTPException(status_code=400, detail="The maximum allowed question_count is 10.")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="question_count must be an integer.")
 
     try:
         # Extract text from the uploaded PDF
@@ -42,23 +48,23 @@ async def generate_exam(
 
         # Prepare the prompt for gpt-3.5-turbo
         prompt = (
-                    f"Extract meaningful exam {question_count} questions and answers from the following text. "
-                    f"Make the {question_count} questions in this language: {language}. "
-                    f"Questions should be of {level} difficulty.\n\n"
-                    f"Here is the text:\n{text}\n\n"
-                    f"Make sure to put the questions in this JSON format:\n"
-                    f"{{\n"
-                    f"    \"questions\": [\n"
-                    f"        {{\n"
-                    f"            \"id\": \"uniqueId\",\n"
-                    f"            \"questionHead\": \"string\",\n"
-                    f"            \"answers\": [\"string\", \"string\", \"string\", \"string\"],\n"
-                    f"            \"correctAnswer\": \"index of correct answer - int\"\n"
-                    f"        }}\n"
-                    f"    ]\n"
-                    f"}}"
-                    f"Just give me the json format as a response.\n"
-                )
+            f"Extract meaningful exam {question_count} questions and answers from the following text. "
+            f"Make the {question_count} questions in this language: {language}. "
+            f"Questions should be of {level} difficulty.\n\n"
+            f"Here is the text:\n{text}\n\n"
+            f"Make sure to put the questions in this JSON format:\n"
+            f"{{\n"
+            f"    \"questions\": [\n"
+            f"        {{\n"
+            f"            \"id\": \"uniqueId\",\n"
+            f"            \"questionHead\": \"string\",\n"
+            f"            \"answers\": [\"string\", \"string\", \"string\", \"string\"],\n"
+            f"            \"correctAnswer\": \"index of correct answer - int\"\n"
+            f"        }}\n"
+            f"    ]\n"
+            f"}}"
+            f"Just give me the json format as a response.\n"
+        )
         # Query gpt-3.5-turbo for question generation
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -72,7 +78,7 @@ async def generate_exam(
 
         # Parse response using JSON parser
         response_content = response.choices[0].message.content
-        print (response_content)
+        print(response_content)
         try:
             questions = json.loads(response_content)  # Use json.loads to safely parse JSON
         except json.JSONDecodeError as e:
