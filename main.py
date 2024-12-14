@@ -16,12 +16,15 @@ app = FastAPI()
 class ExamRequest(BaseModel):
     language: str  # "English" or "Arabic"
     level: str     # "easy", "medium", "difficult"
+    question_count: str
 
 @app.post("/generate-exam")
 async def generate_exam(
     pdf_file: UploadFile,
     language: str = Form(...),
     level: str = Form(...),
+    question_count: str = Form(...),
+
 ):
     # Validate inputs
     if language not in ["English", "Arabic"]:
@@ -40,7 +43,7 @@ async def generate_exam(
         # Prepare the prompt for gpt-3.5-turbo
         prompt = (
                     f"Extract meaningful exam 2 questions and answers from the following text. "
-                    f"Make the 2 questions in this language: {language}. "
+                    f"Make the {question_count} questions in this language: {language}. "
                     f"Questions should be of {level} difficulty.\n\n"
                     f"Here is the text:\n{text}\n\n"
                     f"Make sure to put the questions in this JSON format:\n"
