@@ -9,7 +9,7 @@ import os
 import json
 
 client = OpenAI(
-    api_key="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",  
+    api_key=os.environ.get("OPENAI_API_KEY"),  # This is the default and can be omitted
 )
 app = FastAPI()
 
