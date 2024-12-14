@@ -40,7 +40,7 @@ async def generate_exam(
         # Prepare the prompt for gpt-3.5-turbo
         prompt = (
                     f"Extract meaningful exam 2 questions and answers from the following text. "
-                    f"Make the 3 questions in this language: {language}. "
+                    f"Make the 2 questions in this language: {language}. "
                     f"Questions should be of {level} difficulty.\n\n"
                     f"Here is the text:\n{text}\n\n"
                     f"Make sure to put the questions in this JSON format:\n"
