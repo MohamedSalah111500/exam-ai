@@ -17,7 +17,8 @@ app = FastAPI()
 # Configure CORS
 origins = [
     "http://localhost:4200",  # Replace with your Angular app's URL
-    "https://platx.onrender.com/"  # Add your production domain if needed
+    "https://platx.onrender.com"  # Add your production domain if needed
+    "https://exam-ai-14pq.onrender.com"
 ]
 app.add_middleware(
     CORSMiddleware,
