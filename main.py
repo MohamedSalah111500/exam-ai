@@ -18,7 +18,8 @@ app = FastAPI()
 origins = [
     "http://localhost:4200",  
     "https://platx.onrender.com",
-    "https://exam-ai-14pq.onrender.com"
+    "https://exam-ai-14pq.onrender.com",
+    "https://platx.net"
 ]
 app.add_middleware(
     CORSMiddleware,
