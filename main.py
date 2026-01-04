@@ -14,16 +14,11 @@ client = OpenAI(api_key=os.environ.get('DEEPSEEK_API_KEY'), base_url="https://ap
 
 app = FastAPI()
 
-# Configure CORS
-origins = [
-    "http://localhost:4200",
-    "https://platx.onrender.com",
-    "https://exam-ai-14pq.onrender.com",
-    "https://platx.net"
-]
+# CORS config
+origins = ["http://localhost:4200", "https://platx.onrender.com", "https://exam-ai-14pq.onrender.com", "https://platx.net"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,10 +27,18 @@ app.add_middleware(
 class ExamRequest(BaseModel):
     language: str
     level: str
-    question_count: str
+    question_count: int
     notes: Optional[str] = None
 
 MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
+
+def extract_text_from_pdf(file: UploadFile) -> str:
+    pdf_reader = PyPDF2.PdfReader(file.file)
+    return "".join(page.extract_text() or "" for page in pdf_reader.pages)
+
+def extract_text_from_word(file: UploadFile) -> str:
+    doc = docx.Document(file.file)
+    return "\n".join([p.text for p in doc.paragraphs])
 
 @app.post("/generate-exam")
 async def generate_exam(
@@ -44,7 +47,7 @@ async def generate_exam(
     language: str = Form(...),
     level: str = Form(...),
     question_count: str = Form(...),
-    notes: Optional[str] = Form(None)
+    notes: str = Form("")
 ):
     # Validate language and level
     if language not in ["English", "Arabic"]:
@@ -60,71 +63,72 @@ async def generate_exam(
     except ValueError:
         raise HTTPException(status_code=400, detail="question_count must be an integer.")
 
-    # Validate input: must have either file or text
-    if not pdf_file and (not text_content or not text_content.strip()):
-        raise HTTPException(status_code=400, detail="You must provide either a PDF file or text input.")
+    # Must provide either file or text
+    if not pdf_file and not text_content:
+        raise HTTPException(status_code=400, detail="You must provide either a file or text input.")
 
-    # Check file size
+    # Extract text from file if uploaded
+    text = ""
     if pdf_file:
-        pdf_file.file.seek(0, os.SEEK_END)
-        size = pdf_file.file.tell()
-        pdf_file.file.seek(0)
-        if size > MAX_FILE_SIZE:
+        if pdf_file.spool_max_size > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="File exceeds maximum size of 2 MB.")
-
-    try:
-        # Extract text from PDF if file provided
-        if pdf_file:
-            pdf_reader = PyPDF2.PdfReader(pdf_file.file)
-            text = "".join(page.extract_text() or "" for page in pdf_reader.pages)
+        filename = pdf_file.filename.lower()
+        if filename.endswith(".pdf"):
+            text = extract_text_from_pdf(pdf_file)
+        elif filename.endswith(".docx"):
+            text = extract_text_from_word(pdf_file)
         else:
-            text = text_content.strip()
+            raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF or DOCX allowed.")
+    else:
+        text = text_content.strip()
 
-        if not text:
-            raise HTTPException(status_code=400, detail="No text found to generate questions.")
+    if not text:
+        raise HTTPException(status_code=400, detail="No text found to generate questions.")
 
-        # Prepare AI prompt
-        prompt = (
-            f"Extract {question_count} meaningful exam questions and answers from the following text. "
-            f"Make them in {language} language. Questions should be {level} difficulty. "
-        )
-        if notes:
-            prompt += f"Notes: {notes}\n"
-        prompt += f"\nText:\n{text}\n\n"
-        prompt += "Output in JSON format like:\n"
-        prompt += """{
+    # Prepare prompt for Deepseek
+    prompt = f"""
+ONLY RETURN JSON.
+Generate {question_count_int} exam questions and answers from the following text.
+Language: {language}, Difficulty: {level}.
+Notes: {notes}
+
+Text:
+{text}
+
+Return JSON in this format exactly:
+{{
   "questions": [
-    {
+    {{
       "id": "uniqueId",
       "questionHead": "string",
-      "answers": ["string","string","string","string"],
-      "correctAnswer": 0
-    }
+      "answers": ["string", "string", "string", "string"],
+      "correctAnswer": "index of correct answer - int"
+    }}
   ]
-}"""
+}}
+"""
 
-        # Call OpenAI GPT-5 Nano
+    try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": "You are an educational content generator."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1000,
-            temperature=0.7
+            temperature=0.7,
+            max_tokens=1500
         )
 
-        response_content = response.choices[0].message.content
+        response_content = response.choices[0].message.content.strip()
         try:
             questions = json.loads(response_content)
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to parse JSON from AI response: {str(e)}")
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse JSON from AI response. Raw output: {response_content}"
+            )
 
         return JSONResponse(content={"questions": questions})
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "message": "Server is running"}
