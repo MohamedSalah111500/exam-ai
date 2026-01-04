@@ -25,6 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+
 # ================= HELPERS =================
 def validate_file_size(file: UploadFile):
     file.file.seek(0, os.SEEK_END)
@@ -45,6 +47,19 @@ def extract_text_from_word(file: UploadFile) -> str:
     return "\n".join(p.text for p in document.paragraphs)
 
 # ================= ENDPOINT =================
+
+@app.get("/health")
+def health_check():
+    openai_key_exists = bool(os.environ.get("OPENAI_API_KEY"))
+
+    return {
+        "status": "ok",
+        "service": "PLATX Exam AI",
+        "openai_key": openai_key_exists,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+    
 @app.post("/generate-exam")
 async def generate_exam(
     file: Optional[UploadFile] = None,
