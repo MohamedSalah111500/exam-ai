@@ -61,8 +61,8 @@ async def generate_exam(
         raise HTTPException(status_code=400, detail="question_count must be between 1 and 10.")
 
     # Validate that either file or text is provided
-    if not pdf_file and not text_content:
-        raise HTTPException(status_code=400, detail="You must provide either a file or text input.")
+    # if not pdf_file and not text_content:
+    #     raise HTTPException(status_code=400, detail="You must provide either a file or text input.")
 
     # Extract text from file if uploaded
     text = ""
