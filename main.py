@@ -82,9 +82,12 @@ async def generate_exam(
 
     if text_content:
         text = text_content.strip()
+        
+    else: 
+        text = "no content provided"
 
-    if not text:
-        raise HTTPException(status_code=400, detail="No text found to generate questions.")
+    # if not text:
+    #     raise HTTPException(status_code=400, detail="No text found to generate questions.")
 
     # Build prompt
     prompt = (
