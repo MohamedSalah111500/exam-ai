@@ -1,142 +1,139 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+from typing import List
+import os, json, uuid, re
 import PyPDF2
 import docx2txt
 from openai import OpenAI
-import os
-import json
-import re
 
-# Initialize OpenAI client
-#client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-client = OpenAI(api_key=os.environ.get('DEEPSEEK_API_KEY'), base_url="https://api.deepseek.com")
-
-app = FastAPI()
-
-# Configure CORS
-origins = [
-    "http://localhost:4200",
-    "https://platx.onrender.com",
-    "https://exam-ai-14pq.onrender.com",
-    "https://platx.net"
-]
+# ================= CONFIG =================
+app = FastAPI(title="AI CV Matcher - DeepSeek")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic model for validation
-class ExamRequest(BaseModel):
-    language: str  # "English" or "Arabic"
-    level: str     # "easy", "medium", "difficult"
-    question_count: int
-    notes: Optional[str] = None
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+client = OpenAI(api_key=os.environ.get('DEEPSEEK_API_KEY'), base_url="https://api.deepseek.com")
 
-@app.post("/generate-exam")
-async def generate_exam(
-    pdf_file: Optional[UploadFile] = None,
-    text_content: Optional[str] = Form(None),
-    language: str = Form(...),
-    level: str = Form(...),
-    question_count: int = Form(...),
-    notes: Optional[str] = Form(None)
-):
-    # Validate inputs
-    if language not in ["English", "Arabic"]:
-        raise HTTPException(status_code=400, detail="Invalid language. Use 'English' or 'Arabic'.")
-    if level not in ["easy", "medium", "difficult"]:
-        raise HTTPException(status_code=400, detail="Invalid level. Use 'easy', 'medium', or 'difficult'.")
-    if question_count < 1 or question_count > 10:
-        raise HTTPException(status_code=400, detail="question_count must be between 1 and 10.")
-
-    # Validate that either file or text is provided
-    # if not pdf_file and not text_content:
-    #     raise HTTPException(status_code=400, detail="You must provide either a file or text input.")
-
-    # Extract text from file if uploaded
+# ================= HELPERS =================
+def read_pdf(path: str) -> str:
     text = ""
-    if pdf_file:
-        # File size validation (max 2MB)
-        contents = await pdf_file.read()
-        if len(contents) > 2 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File size exceeds 2MB limit.")
-        
-        if pdf_file.filename.lower().endswith(".pdf"):
-            pdf_reader = PyPDF2.PdfReader(pdf_file.file)
-            text = "".join(page.extract_text() for page in pdf_reader.pages)
-        elif pdf_file.filename.lower().endswith(".docx"):
-            text = docx2txt.process(pdf_file.file)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF or DOCX allowed.")
+    with open(path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text += page.extract_text() or ""
+    return text
 
-    if text_content:
-        text = text_content.strip()
-        
-    else: 
-        text = "no content provided"
+def read_docx(path: str) -> str:
+    return docx2txt.process(path)
 
-    # if not text:
-    #     raise HTTPException(status_code=400, detail="No text found to generate questions.")
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
-    # Build prompt
-    prompt = (
-        f"Extract meaningful exam {question_count} questions and answers from the following text. "
-        f"Use the language: {language}. "
-        f"Questions should be of {level} difficulty. "
-        f"{notes or ''}\n\n"
-        f"Text:\n{text}\n\n"
-        f"Return the questions in this JSON format ONLY:\n"
-        f"{{\n"
-        f"  \"questions\": [\n"
-        f"    {{\n"
-        f"      \"id\": \"uniqueId\",\n"
-        f"      \"questionHead\": \"string\",\n"
-        f"      \"answers\": [\"string\", \"string\", \"string\", \"string\"],\n"
-        f"      \"correctAnswer\": int\n"
-        f"    }}\n"
-        f"  ]\n"
-        f"}}"
-    )
+def extract_json(raw: str) -> dict:
+    """
+    Remove ```json ``` and parse safely
+    """
+    raw = raw.strip()
+
+    if raw.startswith("```"):
+        raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
 
     try:
-        # Query AI
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "You are an educational content generator."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2000,
-            temperature=0.7
-        )
+        return json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"Invalid JSON from AI: {raw}")
 
-        response_content = response.choices[0].message.content.strip()
+# ================= AI =================
+def analyze_cv_with_ai(cv_text: str, job_desc: str) -> dict:
+    prompt = f"""
+You are an ATS system.
 
-        # Strip Markdown code block if exists
-        match = re.search(r"```(?:json)?\n(.*)```", response_content, re.DOTALL)
-        if match:
-            response_content = match.group(1).strip()
+Compare the CV with the Job Description.
+Return ONLY valid JSON (no markdown).
+
+JSON format:
+{{
+  "score": number from 0 to 100,
+  "comment": "short professional comment"
+}}
+
+Job Description:
+{job_desc}
+
+CV:
+{cv_text[:6000]}
+"""
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    raw_output = response.choices[0].message.content
+    return extract_json(raw_output)
+
+# ================= API =================
+@app.post("/analyze-cvs")
+async def analyze_cvs(
+    files: List[UploadFile] = File(...),
+    job_description: str = Form(...),
+    notes: str = Form("")
+):
+    if not files:
+        raise HTTPException(400, "No CVs uploaded")
+
+    if len(files) > 20:
+        raise HTTPException(400, "Maximum 20 CVs allowed")
+
+    results = []
+
+    for file in files:
+        ext = file.filename.split(".")[-1].lower()
+        file_id = str(uuid.uuid4())
+        path = os.path.join(UPLOAD_DIR, f"{file_id}.{ext}")
+
+        with open(path, "wb") as f:
+            f.write(await file.read())
+
+        if ext == "pdf":
+            text = read_pdf(path)
+        elif ext in ["docx", "doc"]:
+            text = read_docx(path)
+        else:
+            raise HTTPException(400, f"Unsupported file: {file.filename}")
+
+        text = clean_text(text)
 
         try:
-            questions = json.loads(response_content)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to parse JSON from AI response. Raw output: {response_content}"
-            )
+            ai_result = analyze_cv_with_ai(text, job_description)
+        except Exception as e:
+            raise HTTPException(500, str(e))
 
-        return JSONResponse(content={"questions": questions})
+        results.append({
+            "filename": file.filename,
+            "score": ai_result["score"],
+            "comment": ai_result["comment"]
+        })
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    return {
+        "total": len(results),
+        "job_description": job_description,
+        "notes": notes,
+        "ranked_cvs": results
+    }
+
+# ================= HEALTH =================
+@app.get("/health")
+def health():
+    return {"status": "ok"}
