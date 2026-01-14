@@ -34,7 +34,7 @@ async def generate_exam(
     question_count: int = Form(...),
     notes: Optional[str] = Form(None)
 ):
-    # 1. استخراج النص من الملفات أو الحقول النصية
+    # 1. Extract Text
     source_text = ""
     if pdf_file:
         contents = await pdf_file.read()
@@ -54,34 +54,31 @@ async def generate_exam(
     if not source_text.strip():
         raise HTTPException(status_code=400, detail="لم يتم العثور على محتوى لإنشاء الأسئلة.")
 
-    # 2. بناء البرومبت ليتوافق مع دالة mapAiQuestions
-    # ملاحظة: دالة الـ map تطلب "id" لتحويله لـ Int وتطلب "questionHead"
-    instruction_notes = f"ملاحظات إضافية من المستخدم: {notes}" if notes else ""
+    # 2. Refined Prompt for better mapping
+    instruction_notes = f"User Notes: {notes}" if notes else ""
     
     prompt = (
-        f"SOURCE TEXT:\n{source_text}\n\n"
-        f"TASK:\nGenerate exactly {question_count} multiple-choice questions in {language}.\n"
-        f"Difficulty Level: {level}.\n"
-        f"{instruction_notes}\n\n"
-        f"CRITICAL: Use ONLY the provided text. Return valid JSON with this EXACT structure:\n"
+        f"Generate exactly {question_count} MCQs based on this text: {source_text[:2000]}\n"
+        f"Language: {language}, Level: {level}. {instruction_notes}\n"
+        f"Return ONLY a JSON object with this structure:\n"
         f"{{\n"
         f"  \"questions\": [\n"
         f"    {{\n"
-        f"      \"id\": \"1\",\n"  # نرسله كـ String لأن الدالة تستخدم parseInt
-        f"      \"questionHead\": \"نص السؤال هنا\",\n"
-        f"      \"answers\": [\"choice 1\", \"choice 2\", \"choice 3\", \"choice 4\"],\n"
-        f"      \"correctAnswer\": 0\n" # رقم الـ index للخيار الصحيح (0-3)
+        f"      \"id\": \"1\",\n"
+        f"      \"questionHead\": \"Question text here\",\n"
+        f"      \"answers\": [\"A\", \"B\", \"C\", \"D\"],\n"
+        f"      \"correctAnswer\": 0\n"
         f"    }}\n"
         f"  ]\n"
         f"}}"
     )
 
-    # 3. طلب البيانات من الذكاء الاصطناعي
     try:
+        # 3. AI Request
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "You are a professional exam creator for PlatX platform. Output JSON only."},
+                {"role": "system", "content": "You are a professional teacher. Return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
             response_format={'type': 'json_object'},
@@ -90,22 +87,22 @@ async def generate_exam(
 
         response_content = response.choices[0].message.content.strip()
         ai_data = json.loads(response_content)
-        questions_list = ai_data.get("questions", [])
+        
+        # Ensure we are passing the list of questions, not the whole object, 
+        # to match your frontend's 'questions' property
+        raw_questions = ai_data.get("questions", [])
 
-        # 4. تغليف البيانات في هيكل الـ Exam المتوقع من الفرونت-اند
-        exam_response = {
-            "id": 0, # سيتم توليده في قاعدة البيانات لاحقاً
-            "name": f"اختبار ذكي - {level}",
+        # 4. Final Structure for Frontend Mapping
+        # This matches the "Exam" object structure your frontend likely expects
+        return {
+            "id": 0,
+            "name": f"اختبار {level} - {language}",
             "isAutoCorrect": True,
             "createdBy": 1,
             "creationTime": datetime.now().isoformat(),
-            "questions": questions_list,
+            "questions": raw_questions,  # This list must contain objects with questionHead, answers, etc.
             "isShowCorrectAnswers": True
         }
 
-        return JSONResponse(content=exam_response)
-
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="فشل الذكاء الاصطناعي في تنسيق البيانات بشكل صحيح.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Mapping Error: {str(e)}")
