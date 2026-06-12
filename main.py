@@ -6,7 +6,6 @@ import docx2txt
 from openai import OpenAI
 import os
 import json
-import httpx
 from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel
@@ -112,16 +111,13 @@ async def generate_exam(
 
 # ----------------------------------------------------------------------
 # Student chatbot
-# Flow: student question + tenant domain
-#   -> fetch that tenant's live knowledge base from PlatX (.NET)
-#   -> ask DeepSeek to answer ONLY from that knowledge
-#   -> return the answer
-# The knowledge base is sent on every request, ordered stable-first
-# (system rules + knowledge, then question) so DeepSeek auto-caches it.
+# This service is called server-to-server by PlatX (.NET), NOT by the
+# browser. PlatX authenticates the student, resolves the tenant from the
+# JWT, builds the tenant's knowledge base, and sends it here as `context`.
+# We only ask DeepSeek to answer from that context.
+# The context is sent on every request, ordered stable-first (system rules
+# + context, then question) so DeepSeek auto-caches it.
 # ----------------------------------------------------------------------
-
-# Base URL of the PlatX (.NET) backend, e.g. https://api.platx.com
-PLATX_API_BASE = os.environ.get("PLATX_API_BASE", "http://localhost:5000")
 
 
 class ChatMessage(BaseModel):
@@ -131,7 +127,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-    domain: str                            # tenant domain, used to load the right knowledge base
+    context: str = ""                      # tenant knowledge base, built and sent by PlatX
     history: Optional[List[ChatMessage]] = None
 
 
@@ -149,30 +145,12 @@ CHATBOT_SYSTEM_PROMPT = (
 )
 
 
-async def fetch_tenant_knowledge(domain: str) -> str:
-    """Call PlatX to get the live knowledge base text for this tenant."""
-    url = f"{PLATX_API_BASE}/api/Chatbot/GetKnowledge"
-    try:
-        async with httpx.AsyncClient(timeout=15) as http:
-            resp = await http.post(url, json={"Domian": domain})
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("knowledge", "") or ""
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=400, detail=f"تعذّر تحميل معلومات المنصة: {e.response.status_code}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"تعذّر الاتصال بخادم المنصة: {str(e)}")
-
-
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="السؤال فارغ.")
-    if not req.domain or not req.domain.strip():
-        raise HTTPException(status_code=400, detail="domain مطلوب.")
 
-    knowledge = await fetch_tenant_knowledge(req.domain.strip())
-    knowledge = knowledge.strip() or "لا توجد معلومات متاحة حالياً."
+    knowledge = (req.context or "").strip() or "لا توجد معلومات متاحة حالياً."
 
     context_block = (
         "=== معلومات المنصة ===\n"
