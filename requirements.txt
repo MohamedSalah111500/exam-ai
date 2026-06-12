@@ -4,3 +4,5 @@ python-multipart
 PyPDF2
 docx2txt
 openai
+httpx
+pydantic

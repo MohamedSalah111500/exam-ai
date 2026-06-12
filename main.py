@@ -6,8 +6,10 @@ import docx2txt
 from openai import OpenAI
 import os
 import json
+import httpx
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+from pydantic import BaseModel
 
 # إعداد العميل لـ DeepSeek
 client = OpenAI(
@@ -106,3 +108,99 @@ async def generate_exam(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Mapping Error: {str(e)}")
+
+
+# ----------------------------------------------------------------------
+# Student chatbot
+# Flow: student question + tenant domain
+#   -> fetch that tenant's live knowledge base from PlatX (.NET)
+#   -> ask DeepSeek to answer ONLY from that knowledge
+#   -> return the answer
+# The knowledge base is sent on every request, ordered stable-first
+# (system rules + knowledge, then question) so DeepSeek auto-caches it.
+# ----------------------------------------------------------------------
+
+# Base URL of the PlatX (.NET) backend, e.g. https://api.platx.com
+PLATX_API_BASE = os.environ.get("PLATX_API_BASE", "http://localhost:5000")
+
+
+class ChatMessage(BaseModel):
+    role: str          # "user" or "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    question: str
+    domain: str                            # tenant domain, used to load the right knowledge base
+    history: Optional[List[ChatMessage]] = None
+
+
+CHATBOT_SYSTEM_PROMPT = (
+    "أنت مساعد ذكي لمنصة تعليمية. مهمتك الإجابة على أسئلة الطلاب بالاعتماد *فقط* "
+    "على المعلومات الموجودة في قسم (معلومات المنصة) أدناه.\n"
+    "قواعد مهمة:\n"
+    "1. لا تخترع أي معلومة غير موجودة في (معلومات المنصة).\n"
+    "2. إذا كان السؤال عن شيء غير موجود في المعلومات (مثل كورس أو معلم غير مذكور)، "
+    "قل بوضوح أن هذه المعلومة غير متوفرة حالياً وانصح الطالب بالتواصل مع الإدارة عبر "
+    "أرقام التواصل الرسمية.\n"
+    "3. لا تعطِ أي أرقام هواتف أو بيانات تواصل شخصية للمعلمين؛ استخدم فقط أرقام التواصل الرسمية للمنصة.\n"
+    "4. أجب بنفس لغة الطالب، وبأسلوب ودود ومختصر.\n"
+    "5. لا تذكر أنك تقرأ من (معلومات المنصة)؛ فقط أجب بشكل طبيعي."
+)
+
+
+async def fetch_tenant_knowledge(domain: str) -> str:
+    """Call PlatX to get the live knowledge base text for this tenant."""
+    url = f"{PLATX_API_BASE}/api/Chatbot/GetKnowledge"
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.post(url, json={"Domian": domain})
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("knowledge", "") or ""
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f"تعذّر تحميل معلومات المنصة: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"تعذّر الاتصال بخادم المنصة: {str(e)}")
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="السؤال فارغ.")
+    if not req.domain or not req.domain.strip():
+        raise HTTPException(status_code=400, detail="domain مطلوب.")
+
+    knowledge = await fetch_tenant_knowledge(req.domain.strip())
+    knowledge = knowledge.strip() or "لا توجد معلومات متاحة حالياً."
+
+    context_block = (
+        "=== معلومات المنصة ===\n"
+        f"{knowledge}\n"
+        "=== نهاية المعلومات ==="
+    )
+
+    # stable-first ordering so DeepSeek caches the system rules + knowledge
+    messages = [
+        {"role": "system", "content": CHATBOT_SYSTEM_PROMPT},
+        {"role": "system", "content": context_block},
+    ]
+
+    # include recent history so follow-up questions keep context
+    if req.history:
+        for m in req.history[-10:]:
+            if m.role in ("user", "assistant") and m.content.strip():
+                messages.append({"role": m.role, "content": m.content})
+
+    messages.append({"role": "user", "content": req.question.strip()})
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.2,
+        )
+        answer = response.choices[0].message.content.strip()
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat Error: {str(e)}")
