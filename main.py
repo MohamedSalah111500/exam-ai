@@ -6,6 +6,7 @@ import docx2txt
 from openai import OpenAI
 import os
 import io
+import re
 import json
 import requests
 from datetime import datetime
@@ -303,37 +304,55 @@ async def chat(req: ChatRequest):
 
 # ----------------------------------------------------------------------
 # Voice student registration
-# Called server-to-server by PlatX after an admin/teacher records a voice note
-# describing a new student. Audio is transcribed (STT), then DeepSeek merges the
-# transcript into the structured student form and asks for what is still missing.
+# Called server-to-server by PlatX after a student records a voice note on the
+# register screen. Audio is transcribed (STT), then DeepSeek merges the transcript
+# into the signup form (name / email / password) and asks for what is still missing.
 # ----------------------------------------------------------------------
 
-STUDENT_FIELD_KEYS = (
-    "firstName", "lastName", "email", "phoneNumber",
-    "emergencyContact", "address", "dateOfBirth", "groupId",
-)
-REQUIRED_STUDENT_FIELDS = ("firstName", "lastName", "email", "phoneNumber")
+STUDENT_FIELD_KEYS = ("firstName", "lastName", "email", "password")
+PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9]{8,}$")
 
 VOICE_STUDENT_SYSTEM_PROMPT = (
-    "You are a data-entry assistant for an educational platform. A teacher dictates a new "
-    "student's details by voice (Arabic, English, or mixed). Extract the student record from "
-    "the transcript and merge it with the fields already collected in earlier turns.\n"
-    "Rules:\n"
-    "1. Never invent data. A field is filled only if the transcript or the previously collected "
-    "fields state it clearly; otherwise it is null.\n"
-    "2. Newer information in the transcript overrides previously collected fields.\n"
-    "3. Normalize: phone numbers as digits only (keep a leading +country code if spoken); "
-    "email lower-case with spoken words like 'at'/'dot'/'آت'/'نقطة' converted to '@' and '.'; "
-    "dateOfBirth as YYYY-MM-DD (null if the year is unknown); names in the language they were spoken, "
-    "split into firstName and lastName (if only one name is given put it in firstName).\n"
-    "4. groupId must be the id of the single best matching group from the provided group list, "
-    "or null when nothing matches; never output an id outside that list.\n"
-    "5. missingFields lists the required fields (firstName, lastName, email, phoneNumber) that are still null.\n"
-    "6. followUpQuestion is one short friendly question, in the reply language, asking for the missing "
-    "required fields (mention all of them in one sentence). When nothing is missing, make it a one-line "
-    "confirmation summarizing the record and asking the teacher to review and save.\n"
-    "7. Return ONLY a JSON object with keys: fields (object with all of: firstName, lastName, email, "
-    "phoneNumber, emergencyContact, address, dateOfBirth, groupId), missingFields (array), followUpQuestion (string)."
+    "You are a smart voice form-filling assistant for a student sign-up form on an educational platform. "
+    "The student speaks in Arabic, English, or a mix. You receive the transcript of their latest recording "
+    "plus the fields already collected in earlier recordings, and you return the updated form.\n"
+    "\n"
+    "FORM FIELDS: firstName, lastName, email, password.\n"
+    "\n"
+    "MERGING & UPDATES:\n"
+    "- Start from the previously collected fields and apply what the new transcript says.\n"
+    "- The student may correct or update anything (\"change my last name to Ali\", \"غيّر الإيميل\", \"no, it's ...\", "
+    "\"my name is actually ...\"): the newest statement wins.\n"
+    "- The student may remove a field (\"remove the email\", \"امسح الباسورد\"): set it to null.\n"
+    "- Fields not mentioned in the transcript stay exactly as previously collected.\n"
+    "- Never invent a value. If something is unclear or was not said, leave it null.\n"
+    "\n"
+    "LANGUAGE:\n"
+    "- Default is English: write firstName and lastName in Latin letters (transliterate Arabic names, e.g. "
+    "محمد -> Mohamed, أحمد -> Ahmed, فاطمة -> Fatma) and write followUpQuestion in English.\n"
+    "- Only if the student explicitly asks for Arabic (\"بالعربي\", \"اكتب اسمي بالعربي\", \"in Arabic\") keep the names in "
+    "Arabic script and write followUpQuestion in Arabic. Keep that choice for the rest of the conversation "
+    "(if previously collected names are in Arabic script, the student already chose Arabic).\n"
+    "\n"
+    "NORMALIZATION:\n"
+    "- Spelled-out letters (\"m o h a m e d\", \"ميم واو حاء\") are joined into one word.\n"
+    "- Numbers spoken as words (\"one two three\", \"واحد اثنين ثلاثة\", \"خمسة\") become digits.\n"
+    "- email: lower-case; \"at\"/\"آت\" -> \"@\", \"dot\"/\"نقطة\" -> \".\", \"underscore\"/\"شرطة سفلية\" -> \"_\", "
+    "\"dash\"/\"شرطة\" -> \"-\"; remove spaces; if only a well-known provider is said (gmail, yahoo, hotmail, "
+    "outlook, icloud) without a TLD, append \".com\".\n"
+    "- password: the value the student says after \"password\"/\"كلمة السر\"/\"الباسورد\"/\"كلمة المرور\"; join spoken "
+    "letters and digits, remove spaces, keep the letter case the student states (\"capital A\" -> \"A\"; default lower-case). "
+    "The password must be 8+ characters using ONLY English letters and digits. If what was said violates that "
+    "(too short, spaces, symbols, Arabic letters), set password to null and explain the rule in followUpQuestion.\n"
+    "- Capitalize the first letter of Latin names.\n"
+    "\n"
+    "OUTPUT: return ONLY a JSON object:\n"
+    "{\"fields\": {\"firstName\": ..., \"lastName\": ..., \"email\": ..., \"password\": ...}, "
+    "\"missingFields\": [...], \"followUpQuestion\": \"...\"}\n"
+    "- missingFields: which of the four fields are still null.\n"
+    "- followUpQuestion: one short friendly sentence. If fields are missing, ask for all of them in one sentence. "
+    "If a value looks doubtful (unusual email, odd spelling) ask the student to confirm it. If everything is complete, "
+    "briefly summarize name and email (never repeat the password) and ask them to review and submit."
 )
 
 
@@ -364,24 +383,23 @@ def _parse_json_arg(value: Optional[str], default):
     return parsed if isinstance(parsed, type(default)) else default
 
 
-def _normalize_student_fields(raw_fields, groups) -> dict:
+def _normalize_student_fields(raw_fields) -> dict:
     fields = {key: None for key in STUDENT_FIELD_KEYS}
     if not isinstance(raw_fields, dict):
         return fields
-    allowed_group_ids = {int(g["id"]) for g in groups}
     for key in STUDENT_FIELD_KEYS:
         value = raw_fields.get(key)
-        if key == "groupId":
-            try:
-                value = int(value) if value not in (None, "", 0, "0") else None
-            except (TypeError, ValueError):
-                value = None
-            fields[key] = value if value in allowed_group_ids else None
-            continue
         if isinstance(value, (int, float)):
             value = str(value)
-        if isinstance(value, str):
-            value = value.strip()
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if key == "email":
+            value = value.replace(" ", "").lower()
+        elif key == "password":
+            value = value.replace(" ", "")
+            if not PASSWORD_PATTERN.match(value):
+                value = ""
         fields[key] = value or None
     return fields
 
@@ -392,7 +410,6 @@ async def voice_student(
     transcript: Optional[str] = Form(None),
     language: str = Form("auto"),
     current_fields: Optional[str] = Form(None),
-    groups: Optional[str] = Form(None),
 ):
     language = (language or "auto").lower()
     spoken_text = (transcript or "").strip()
@@ -401,19 +418,14 @@ async def voice_student(
     if not spoken_text:
         raise HTTPException(status_code=400, detail="NO_SPEECH")
 
-    known_fields = _parse_json_arg(current_fields, {})
-    group_list = [
-        {"id": int(g["id"]), "name": str(g["name"])}
-        for g in _parse_json_arg(groups, [])
-        if isinstance(g, dict) and g.get("id") is not None and g.get("name")
-    ]
-    reply_language = {"ar": "Arabic", "en": "English"}.get(language, "the same language as the transcript")
+    known_fields = {
+        key: value for key, value in _parse_json_arg(current_fields, {}).items()
+        if key in STUDENT_FIELD_KEYS and isinstance(value, str) and value.strip()
+    }
 
     user_prompt = (
-        f"Reply language for followUpQuestion: {reply_language}\n"
-        f"Available groups (id: name):\n{json.dumps(group_list, ensure_ascii=False)}\n"
         f"Previously collected fields:\n{json.dumps(known_fields, ensure_ascii=False)}\n"
-        f"Transcript:\n{spoken_text[:4000]}"
+        f"Transcript of the new recording:\n{spoken_text[:4000]}"
     )
 
     try:
@@ -430,8 +442,8 @@ async def voice_student(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Voice Student Error: {str(e)}")
 
-    fields = _normalize_student_fields(ai_data.get("fields"), group_list)
-    missing = [key for key in REQUIRED_STUDENT_FIELDS if not fields.get(key)]
+    fields = _normalize_student_fields(ai_data.get("fields"))
+    missing = [key for key in STUDENT_FIELD_KEYS if not fields.get(key)]
     follow_up = ai_data.get("followUpQuestion")
     return {
         "transcript": spoken_text,
