@@ -5,4 +5,5 @@ PyPDF2
 docx2txt
 openai
 httpx
+requests
 pydantic
