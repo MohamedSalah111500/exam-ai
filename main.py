@@ -301,6 +301,87 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Chat Error: {str(e)}")
 
 
+# ----------------------------------------------------------------------
+# CRM insights
+# Called server-to-server by PlatX with a text snapshot of the sales CRM (exact
+# totals plus the most recent leads and their logged activities/comments). The
+# model answers management questions strictly from that snapshot.
+# ----------------------------------------------------------------------
+
+class CrmInsightsRequest(BaseModel):
+    question: str
+    data: str
+    history: Optional[List[ChatMessage]] = None
+
+
+CRM_INSIGHTS_SYSTEM_PROMPT = (
+    "You are a senior sales analyst for PlatX, an Egyptian SaaS company that sells online teaching "
+    "platforms to teachers, tutors and academies. You analyse the company's sales CRM and answer the "
+    "management team's questions.\n"
+    "\n"
+    "DATA YOU RECEIVE:\n"
+    "- 'EXACT TOTALS' are computed by the database over every lead the user can see. Always use them "
+    "for counts and percentages when they answer the question.\n"
+    "- 'LEAD DETAILS' lists the most recently updated leads (it may not include every lead; the last line "
+    "says how many are included). Each lead line has its status, source, priority, dates, agent, notes and "
+    "lost reason, followed by its most recent activities (Note, Call, WhatsApp, Meeting, Email, "
+    "StatusChange, Assignment, FollowUp) with what the team wrote.\n"
+    "- Lead statuses in pipeline order: New, Contacted, Interested, DemoScheduled, Negotiation, Won, Lost.\n"
+    "\n"
+    "HOW TO ANSWER:\n"
+    "- Base every statement only on the data. Never invent leads, numbers, reasons or quotes.\n"
+    "- For 'why' questions (why leads don't convert, what annoys customers, objections), read the lost "
+    "reasons, notes and activity comments, group similar reasons into clear themes, and rank them by how "
+    "many leads mention each theme. Give the count and percentage for each theme and cite 2-3 example lead "
+    "numbers (like #123).\n"
+    "- For rates (e.g. meeting no-shows), explain exactly what you counted and the denominator. When the "
+    "CRM has no dedicated field for something, infer it from the comments, say that it is inferred, and "
+    "base the percentage only on the leads whose comments mention it.\n"
+    "- When a percentage comes from the lead details rather than the exact totals, say it is based on the N "
+    "leads analysed.\n"
+    "- If the data cannot answer the question, say so plainly and suggest what the team should start "
+    "recording in the CRM to answer it next time.\n"
+    "- End with 2-4 short, concrete recommendations when the question is about a problem.\n"
+    "\n"
+    "LANGUAGE AND FORMAT:\n"
+    "- Reply in the language and dialect of the question (Egyptian Arabic if asked in Egyptian Arabic).\n"
+    "- Plain text only: no markdown symbols like #, *, ** or tables. Use short lines, a short title line "
+    "when helpful, and '- ' at the start of list items.\n"
+    "- Be concise and specific; lead with the direct answer."
+)
+
+
+@app.post("/crm-insights")
+def crm_insights(req: CrmInsightsRequest):
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="EMPTY_QUESTION")
+
+    data_block = (
+        "=== CRM SNAPSHOT ===\n"
+        f"{(req.data or '').strip() or 'No CRM data.'}\n"
+        "=== END OF CRM SNAPSHOT ==="
+    )
+
+    messages = [
+        {"role": "system", "content": CRM_INSIGHTS_SYSTEM_PROMPT},
+        {"role": "system", "content": data_block},
+    ]
+    if req.history:
+        for m in req.history[-10:]:
+            if m.role in ("user", "assistant") and m.content.strip():
+                messages.append({"role": m.role, "content": m.content})
+    messages.append({"role": "user", "content": req.question.strip()})
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.2,
+        )
+        return {"answer": response.choices[0].message.content.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CRM Insights Error: {str(e)}")
+
 
 # ----------------------------------------------------------------------
 # Voice student registration
