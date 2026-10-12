@@ -9,9 +9,11 @@ import os
 import io
 import re
 import json
+import base64
 import requests
 from datetime import datetime
 from typing import Optional, List
+from urllib.parse import urlparse
 from pydantic import BaseModel
 
 # إعداد العميل لـ DeepSeek
@@ -20,12 +22,11 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-# Optional vision-capable client (OpenAI-compatible). Set these env vars to enable
-# grading of image uploads. Works with GPT-4o (api.openai.com), or any OpenAI-compatible
-# VLM endpoint. When unset, image uploads fall back to teacher review.
-VISION_API_KEY = os.environ.get('VISION_API_KEY')
-VISION_BASE_URL = os.environ.get('VISION_BASE_URL', 'https://api.openai.com/v1')
-VISION_MODEL = os.environ.get('VISION_MODEL', 'gpt-4o')
+# Image uploads are read by DeepSeek's multimodal model with the same DeepSeek key by default.
+# VISION_* env vars can point to any other OpenAI-compatible vision endpoint instead.
+VISION_API_KEY = os.environ.get('VISION_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
+VISION_BASE_URL = os.environ.get('VISION_BASE_URL', 'https://api.deepseek.com')
+VISION_MODEL = os.environ.get('VISION_MODEL', 'deepseek-flash')
 vision_client = OpenAI(api_key=VISION_API_KEY, base_url=VISION_BASE_URL) if VISION_API_KEY else None
 
 # Speech-to-text (OpenAI-compatible /audio/transcriptions). DeepSeek has no STT, so a
@@ -167,8 +168,8 @@ async def generate_exam(
 # Called server-to-server by PlatX (.NET) after a student submits homework when the
 # grading mode is "AI suggestion" or "AI only". PlatX authenticates the user, enforces
 # the tenant's AI-credit limit, and sends the rubric + the student's work here.
-# Text files (PDF / Word) are extracted and graded by DeepSeek; image files are graded
-# by a vision model when one is configured (see VISION_* env vars).
+# Text files (PDF / Word) are extracted and graded by DeepSeek; image files are read by
+# DeepSeek's multimodal model (see VISION_* env vars to use another provider).
 # ----------------------------------------------------------------------
 
 
@@ -182,7 +183,43 @@ class GradeHomeworkRequest(BaseModel):
     language: str = "auto"
 
 
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+MAX_GRADED_IMAGES = 6
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _url_ext(url: str) -> str:
+    return os.path.splitext(urlparse(url).path.lower())[1]
+
+
+def _image_data_url(url: str) -> Optional[str]:
+    """Download a student image and inline it as a data URL, so the model never has to reach PlatX storage."""
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.content
+        if not data or len(data) > MAX_IMAGE_BYTES:
+            return None
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        mime = ctype if ctype in IMAGE_MIME_BY_EXT.values() else IMAGE_MIME_BY_EXT.get(_url_ext(url))
+        if not mime:
+            return None
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    except Exception:
+        return None
+
+
+def _parse_grade(raw: str, total_score: float) -> dict:
+    match = re.search(r"\{.*\}", raw or "", re.S)
+    data = json.loads(match.group(0) if match else raw)
+    score = float(data.get("score", 0) or 0)
+    return {"score": max(0.0, min(score, float(total_score))), "feedback": data.get("feedback", "")}
 
 
 def _extract_file_text(url: str) -> str:
@@ -207,8 +244,8 @@ async def grade_homework(req: GradeHomeworkRequest):
     if not req.rubric or not req.rubric.strip():
         raise HTTPException(status_code=400, detail="Missing rubric / student work to grade.")
 
-    image_urls = [u for u in (req.file_urls or []) if u.lower().endswith(IMAGE_EXTS)]
-    doc_urls = [u for u in (req.file_urls or []) if not u.lower().endswith(IMAGE_EXTS)]
+    image_urls = [u for u in (req.file_urls or []) if _url_ext(u) in IMAGE_MIME_BY_EXT]
+    doc_urls = [u for u in (req.file_urls or []) if _url_ext(u) not in IMAGE_MIME_BY_EXT]
 
     # 1) Collect any text from uploaded documents.
     extracted = ""
@@ -224,24 +261,26 @@ async def grade_homework(req: GradeHomeworkRequest):
         f"=== RUBRIC & STUDENT WORK ===\n{req.rubric}\n{extracted}\n=== END ==="
     )
 
+    images = []
+    if vision_client is not None:
+        images = [d for d in (_image_data_url(u) for u in image_urls[:MAX_GRADED_IMAGES]) if d]
+
     try:
-        # 2) If the student uploaded images and a vision model is configured, use it.
-        if image_urls and vision_client is not None:
-            content = [{"type": "text", "text": base_instruction}]
-            for u in image_urls[:6]:
-                content.append({"type": "image_url", "image_url": {"url": u}})
+        if images:
+            image_hint = "\n\nThe student's handwritten or photographed work is in the attached images; read it carefully."
+            content = [{"type": "text", "text": base_instruction + image_hint}]
+            content += [{"type": "image_url", "image_url": {"url": d}} for d in images]
             response = vision_client.chat.completions.create(
                 model=VISION_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a professional teacher. Return valid JSON only."},
                     {"role": "user", "content": content},
                 ],
-                response_format={"type": "json_object"},
                 temperature=0.2,
             )
         else:
             note = ""
-            if image_urls and vision_client is None:
+            if image_urls:
                 note = "\n\nNote: the student uploaded image files that could not be read automatically; grade what is available and mention that images need teacher review."
             response = client.chat.completions.create(
                 model="deepseek-chat",
@@ -253,10 +292,7 @@ async def grade_homework(req: GradeHomeworkRequest):
                 temperature=0.2,
             )
 
-        data = json.loads(response.choices[0].message.content.strip())
-        score = float(data.get("score", 0) or 0)
-        score = max(0.0, min(score, float(req.total_score)))
-        return {"score": score, "feedback": data.get("feedback", "")}
+        return _parse_grade(response.choices[0].message.content.strip(), req.total_score)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Grading Error: {str(e)}")
 
