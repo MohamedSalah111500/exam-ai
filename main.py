@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi import FastAPI, UploadFile, Form, HTTPException, Request
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import PyPDF2
@@ -44,8 +45,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _detect_upload_kind(data: bytes, filename: str, content_type: str) -> Optional[str]:
+    """Return "pdf" / "docx" / None. Content bytes win over the filename, because
+    non-ASCII names (e.g. Arabic) can arrive RFC 2047-encoded ("=?utf-8?B?...?=")
+    or as "blob", which would hide the real extension."""
+    head = data[:1024].lstrip()
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if data.startswith(b"PK") and b"word/" in data:
+        return "docx"
+    name = (filename or "").lower()
+    ctype = (content_type or "").lower()
+    if name.endswith(".pdf") or "pdf" in ctype:
+        return "pdf"
+    if name.endswith(".docx") or "wordprocessingml" in ctype:
+        return "docx"
+    return None
+
+
 @app.post("/generate-exam")
 async def generate_exam(
+    request: Request,
     pdf_file: Optional[UploadFile] = None,
     text_content: Optional[str] = Form(None),
     language: str = Form(...),
@@ -53,19 +73,34 @@ async def generate_exam(
     question_count: int = Form(...),
     notes: Optional[str] = Form(None)
 ):
+    # Accept the file under any form field name (file, pdf, document, ...).
+    if pdf_file is None:
+        form = await request.form()
+        pdf_file = next((v for v in form.values() if isinstance(v, StarletteUploadFile)), None)
+
     # 1. Extract Text
     source_text = ""
     if pdf_file:
         contents = await pdf_file.read()
-        pdf_file.file.seek(0)
+        if not contents:
+            raise HTTPException(status_code=400, detail="الملف المرفوع فارغ.")
+        kind = _detect_upload_kind(contents, pdf_file.filename, pdf_file.content_type)
+        if kind is None:
+            raise HTTPException(status_code=400, detail="نوع الملف غير مدعوم. يرجى رفع ملف PDF أو Word (.docx).")
         try:
-            if pdf_file.filename.lower().endswith(".pdf"):
-                pdf_reader = PyPDF2.PdfReader(pdf_file.file)
-                source_text = "".join(page.extract_text() for page in pdf_reader.pages)
-            elif pdf_file.filename.lower().endswith(".docx"):
-                source_text = docx2txt.process(pdf_file.file)
+            if kind == "pdf":
+                pdf_reader = PyPDF2.PdfReader(io.BytesIO(contents))
+                source_text = "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
+            else:
+                source_text = docx2txt.process(io.BytesIO(contents)) or ""
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
+
+        if not source_text.strip() and not (text_content and text_content.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="تعذر استخراج نص من الملف (قد يكون الملف صورًا ممسوحة ضوئيًا). يرجى رفع ملف يحتوي على نص قابل للتحديد.",
+            )
 
     if text_content and text_content.strip():
         source_text += "\n" + text_content.strip()
