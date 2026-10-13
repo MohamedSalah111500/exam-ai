@@ -251,6 +251,8 @@ class GradeHomeworkV2Request(BaseModel):
     file_urls: List[str] = []
     # Pages (PDF pages or photos) the academy's AI credit pays for; set by PlatX.
     max_pages: int = 50
+    # The student's chosen language (e.g. "ar", "en"); every feedback text is written in it.
+    language: Optional[str] = None
 
 
 CHOICE_TYPES = {"single", "multi", "truefalse"}
@@ -279,16 +281,18 @@ HOMEWORK_V2_RULES = (
     "but the student's answer is not.\n"
     "confidence: 'high' only when the answer is clearly visible and unambiguous; 'medium' when probable; 'low' when guessing.\n"
     "Never invent an answer that is not visible.\n"
-    "Feedback is read by the student: write it in the language of the questions, short and useful, with no greetings, "
-    "no empty praise and without repeating the question or the score.\n"
+    "Feedback is read by the student: write it ONLY in the feedback language given in the request, as plain sentences "
+    "(no markdown, lists, emojis or line breaks), short and useful, with no greetings, no empty praise and without "
+    "repeating the question or the score.\n"
     "- question feedback: at most 15 words. essay: on full marks leave it empty; otherwise name exactly what is missing "
     "or wrong and the correct idea. single / multi / truefalse: leave it empty unless the mark is unclear, then say "
     "what is unclear (e.g. two options marked).\n"
-    "- overall feedback: at most 2 short sentences: the main strength, and the one thing to review most, naming its "
-    "question numbers.\n\n"
+    "- strengths: one short sentence on what the student did well (empty if nothing).\n"
+    "- to_review: one short sentence on the one thing to review most, naming its question numbers (empty if nothing).\n\n"
     "Return ONLY a JSON object: "
     "{\"questions\": [{\"id\": <platform question id>, \"answer_found\": true|false, \"selected_options\": [<option numbers>], "
-    "\"confidence\": \"high|medium|low\", \"score\": <number or null>, \"feedback\": \"...\"}], \"feedback\": \"<short overall feedback>\"}"
+    "\"confidence\": \"high|medium|low\", \"score\": <number or null>, \"feedback\": \"...\"}], "
+    "\"strengths\": \"...\", \"to_review\": \"...\"}"
 )
 
 HOMEWORK_PAGE_RULES = HOMEWORK_V2_RULES + (
@@ -313,10 +317,65 @@ HOMEWORK_UPLOAD_ONLY_RULES = (
     "cannot decide; confidence = 'high' only when both the student's mark and the correct answer are clear, otherwise 'medium' or 'low'.\n"
     "Follow the teacher's instructions when they give an answer key or marking rules.\n"
     "Return ONLY a JSON object: {\"items\": [{\"label\": \"...\", \"page\": <number>, \"student_answer\": \"...\", "
-    "\"correct\": true|false|null, \"confidence\": \"high|medium|low\"}], \"feedback\": \"<feedback>\"}\n"
-    "feedback is read by the student: at most 2 short sentences in the language of the work, no greetings or empty "
-    "praise: the main strength, and the one thing to review most, naming its question labels."
+    "\"correct\": true|false|null, \"confidence\": \"high|medium|low\"}], \"strengths\": \"...\", \"to_review\": \"...\"}\n"
+    "strengths and to_review are read by the student: write them ONLY in the feedback language given in the request, as one "
+    "short plain sentence each (no markdown, lists, emojis or line breaks, no greetings or empty praise): what the student "
+    "did well, and the one thing to review most, naming its question labels. Leave one empty if there is nothing to say."
 )
+
+LANGUAGE_NAMES = {
+    "ar": "Arabic", "en": "English", "fr": "French", "de": "German", "es": "Spanish", "it": "Italian",
+    "tr": "Turkish", "ur": "Urdu", "fa": "Persian", "id": "Indonesian", "ms": "Malay", "ru": "Russian",
+    "pt": "Portuguese", "zh": "Chinese", "hi": "Hindi", "bn": "Bengali", "nl": "Dutch",
+}
+
+FEEDBACK_LABELS = {
+    "ar": {"strengths": "نقاط القوة", "to_review": "للمراجعة", "correct": "الإجابات الصحيحة", "of": "من",
+           "wrong": "الإجابات الخاطئة", "unsure": "تحتاج إلى مراجعة المعلم", "sep": "، "},
+    "en": {"strengths": "Strengths", "to_review": "To review", "correct": "Correct answers", "of": "of",
+           "wrong": "Wrong answers", "unsure": "Needs the teacher's review", "sep": ", "},
+}
+
+
+def _language_code(language: Optional[str]) -> str:
+    return (language or "").strip().lower().replace("_", "-").split("-")[0]
+
+
+def _language_instruction(language: Optional[str]) -> str:
+    code = _language_code(language)
+    name = LANGUAGE_NAMES.get(code) or code
+    if not name:
+        return "Feedback language: the language of the questions.\n"
+    return f"Feedback language: {name}. Write every feedback text in {name}, even when the homework is in another language.\n"
+
+
+def _labels(language: Optional[str]) -> dict:
+    return FEEDBACK_LABELS.get(_language_code(language), FEEDBACK_LABELS["en"])
+
+
+def _clean_text(value, limit: int) -> str:
+    """One plain line: no markdown, bullets or line breaks, cut at a word boundary."""
+    text = re.sub(r"\*\*|__|`", "", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(?:#+|>|[-•–*])\s+", "", text).strip("\"' ")
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0].rstrip(",،;:") + "…"
+    return text
+
+
+def _summary_lines(reports, language: Optional[str]) -> list:
+    """'Strengths: ...' and 'To review: ...' lines from the batches (old replies with only 'feedback' still work)."""
+    labels = _labels(language)
+    strengths = [t for t in dict.fromkeys(_clean_text(r.get("strengths"), 220) for r in reports) if t]
+    to_review = [t for t in dict.fromkeys(_clean_text(r.get("to_review"), 220) for r in reports) if t]
+    lines = []
+    if strengths:
+        lines.append(f"{labels['strengths']}: {strengths[0]}")
+    if to_review:
+        lines.append(f"{labels['to_review']}: {' '.join(to_review[:2])}")
+    if not lines:
+        lines += [t for t in dict.fromkeys(_clean_text(r.get("feedback"), 300) for r in reports) if t][:2]
+    return lines
 
 
 def _student_pages(url: str, limit: int):
@@ -404,7 +463,7 @@ def _clean_question_result(item: dict, q: HomeworkQuestion) -> dict:
         "selected_options": selected if q.type in CHOICE_TYPES else [],
         "confidence": confidence,
         "score": score,
-        "feedback": str(item.get("feedback") or "").strip()[:300],
+        "feedback": _clean_text(item.get("feedback"), 200),
     }
 
 
@@ -466,12 +525,6 @@ def _ask_model(rules: str, prompt: str, images) -> dict:
     raw = response.choices[0].message.content or ""
     match = re.search(r"\{.*\}", raw, re.S)
     return json.loads(match.group(0) if match else raw)
-
-
-def _overall_feedback(reports, limit=2) -> str:
-    """The first distinct overall comments of the batches, kept short."""
-    notes = [n for n in dict.fromkeys(str(r.get("feedback") or "").strip() for r in reports) if n]
-    return " ".join(notes[:limit])[:500]
 
 
 def _run_all(jobs):
@@ -554,7 +607,7 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
                       for n, d in model_images]
 
     header = (f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
-              f"Teacher instructions: {req.instructions or '-'}\n")
+              f"Teacher instructions: {req.instructions or '-'}\n" + _language_instruction(req.language))
 
     def listing(questions):
         return "\n\n".join(_describe_homework_question(q, q.number in with_model_image) for q in questions)
@@ -589,11 +642,10 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
     reports = [r for r in results if r is not None]
     failed = len(results) - len(reports)
     pages_read = sum(n for r, n in zip(results, job_pages) if r is not None)
-    feedback = _overall_feedback(reports)
     return {
         "questions": _merge_question_results(reports, req.questions),
         "score": None,
-        "feedback": feedback,
+        "feedback": "\n".join(_summary_lines(reports, req.language)),
         "needs_review": skipped > 0 or unreadable or failed > 0,
         "pages_read": pages_read,
         "pages_skipped": skipped,
@@ -602,7 +654,7 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
 
 def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, documents, skipped, unreadable) -> dict:
     header = (f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
-              f"Teacher instructions: {req.instructions or '-'}\n")
+              f"Teacher instructions: {req.instructions or '-'}\n" + _language_instruction(req.language))
     pages = sheet + question_pages
     batches = _page_batches(pages) if pages else []
     if pages:
@@ -620,7 +672,7 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
     items, seen = [], set()
     for data in reports:
         for item in data.get("items") or []:
-            label = str(item.get("label") or "").strip()[:80]
+            label = _clean_text(item.get("label"), 60)
             page = item.get("page")
             key = (label.lower(), str(page))
             if not label or (page is not None and key in seen):
@@ -639,19 +691,27 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
     right = sum(1 for i in items if i["correct"] is True)
     complete = items and not skipped and not failed
     score = round(float(req.total_score) * right / len(items), 2) if complete else None
-    wrong = [i["label"] for i in items if i["correct"] is False]
     unsure = [i["label"] for i in items if i["correct"] is None or i["confidence"] != "high"]
-    summary = f"✔ {right}/{len(items)}" if items else ""
+    wrong = [i["label"] for i in items if i["correct"] is False and i["confidence"] == "high"]
+    labels = _labels(req.language)
+
+    def listed(names):
+        shown = labels["sep"].join(names[:15])
+        return shown + (f"{labels['sep']}…" if len(names) > 15 else "")
+
+    lines = []
+    if items:
+        lines.append(f"{labels['correct']}: {right} {labels['of']} {len(items)}")
     if wrong:
-        summary += " · ✘ " + ", ".join(wrong[:15])
+        lines.append(f"{labels['wrong']}: {listed(wrong)}")
     if unsure:
-        summary += " · ? " + ", ".join(unsure[:15])
-    model_feedback = _overall_feedback(reports)
+        lines.append(f"{labels['unsure']}: {listed(unsure)}")
+    lines += _summary_lines(reports, req.language)
     return {
         "questions": [],
         "items": items,
         "score": score,
-        "feedback": (summary + ("\n" if summary and model_feedback else "") + model_feedback)[:1500],
+        "feedback": "\n".join(lines),
         "needs_review": not items or bool(unsure) or skipped > 0 or unreadable or failed > 0,
         "pages_read": pages_read,
         "pages_skipped": skipped,
