@@ -35,12 +35,20 @@ VISION_MODEL = os.environ.get('VISION_MODEL', 'deepseek-flash')
 # Homework grading has its own key, endpoint and model; every setting falls back to the shared DeepSeek / vision ones.
 HOMEWORK_API_KEY = os.environ.get('HOMEWORK_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
 HOMEWORK_TEXT_MODEL = os.environ.get('HOMEWORK_TEXT_MODEL', 'deepseek-chat')
-homework_text_client = OpenAI(api_key=HOMEWORK_API_KEY, base_url=os.environ.get('HOMEWORK_BASE_URL', 'https://api.deepseek.com')) if HOMEWORK_API_KEY else None
+HOMEWORK_CALL_TIMEOUT = float(os.environ.get('HOMEWORK_CALL_TIMEOUT', '150'))
+homework_text_client = OpenAI(
+    api_key=HOMEWORK_API_KEY,
+    base_url=os.environ.get('HOMEWORK_BASE_URL', 'https://api.deepseek.com'),
+    timeout=HOMEWORK_CALL_TIMEOUT,
+    max_retries=1,
+) if HOMEWORK_API_KEY else None
 HOMEWORK_VISION_API_KEY = os.environ.get('HOMEWORK_VISION_API_KEY') or os.environ.get('HOMEWORK_API_KEY') or VISION_API_KEY
 HOMEWORK_VISION_MODEL = os.environ.get('HOMEWORK_VISION_MODEL', VISION_MODEL)
 homework_vision_client = OpenAI(
     api_key=HOMEWORK_VISION_API_KEY,
     base_url=os.environ.get('HOMEWORK_VISION_BASE_URL') or VISION_BASE_URL,
+    timeout=HOMEWORK_CALL_TIMEOUT,
+    max_retries=1,
 ) if HOMEWORK_VISION_API_KEY else None
 
 
@@ -154,7 +162,7 @@ def _extract_file_text(url: str) -> str:
 
 
 @router.post("/grade-homework", include_in_schema=False)
-async def grade_homework(req: GradeHomeworkRequest):
+def grade_homework(req: GradeHomeworkRequest):
     if not req.rubric or not req.rubric.strip():
         raise HTTPException(status_code=400, detail="Missing rubric / student work to grade.")
 
@@ -271,7 +279,13 @@ HOMEWORK_V2_RULES = (
     "but the student's answer is not.\n"
     "confidence: 'high' only when the answer is clearly visible and unambiguous; 'medium' when probable; 'low' when guessing.\n"
     "Never invent an answer that is not visible.\n"
-    "feedback: one short sentence per question, in the language of the questions.\n\n"
+    "Feedback is read by the student: write it in the language of the questions, short and useful, with no greetings, "
+    "no empty praise and without repeating the question or the score.\n"
+    "- question feedback: at most 15 words. essay: on full marks leave it empty; otherwise name exactly what is missing "
+    "or wrong and the correct idea. single / multi / truefalse: leave it empty unless the mark is unclear, then say "
+    "what is unclear (e.g. two options marked).\n"
+    "- overall feedback: at most 2 short sentences: the main strength, and the one thing to review most, naming its "
+    "question numbers.\n\n"
     "Return ONLY a JSON object: "
     "{\"questions\": [{\"id\": <platform question id>, \"answer_found\": true|false, \"selected_options\": [<option numbers>], "
     "\"confidence\": \"high|medium|low\", \"score\": <number or null>, \"feedback\": \"...\"}], \"feedback\": \"<short overall feedback>\"}"
@@ -299,7 +313,9 @@ HOMEWORK_UPLOAD_ONLY_RULES = (
     "cannot decide; confidence = 'high' only when both the student's mark and the correct answer are clear, otherwise 'medium' or 'low'.\n"
     "Follow the teacher's instructions when they give an answer key or marking rules.\n"
     "Return ONLY a JSON object: {\"items\": [{\"label\": \"...\", \"page\": <number>, \"student_answer\": \"...\", "
-    "\"correct\": true|false|null, \"confidence\": \"high|medium|low\"}], \"feedback\": \"<short feedback in the language of the work>\"}"
+    "\"correct\": true|false|null, \"confidence\": \"high|medium|low\"}], \"feedback\": \"<feedback>\"}\n"
+    "feedback is read by the student: at most 2 short sentences in the language of the work, no greetings or empty "
+    "praise: the main strength, and the one thing to review most, naming its question labels."
 )
 
 
@@ -318,7 +334,7 @@ def _student_pages(url: str, limit: int):
         resp.raise_for_status()
         data = resp.content
     except Exception:
-        return [], ""
+        return [{"image": None, "text": ""}], ""
 
     ctype = (resp.headers.get("Content-Type") or "").lower()
     if data[:4] == b"%PDF" or _url_ext(url) == ".pdf" or "pdf" in ctype:
@@ -333,17 +349,18 @@ def _student_pages(url: str, limit: int):
                         image = "data:image/jpeg;base64," + base64.b64encode(pix.tobytes("jpeg", jpg_quality=80)).decode("ascii")
                     pages.append({"image": image, "text": text})
         except Exception:
-            return [], ""
-        return pages, ""
+            return [{"image": None, "text": ""}], ""
+        return pages or [{"image": None, "text": ""}], ""
     if _url_ext(url) == ".docx" or data[:2] == b"PK":
         try:
-            return [], (docx2txt.process(io.BytesIO(data)) or "")[:12000]
+            text = (docx2txt.process(io.BytesIO(data)) or "")[:12000]
         except Exception:
-            return [], ""
+            text = ""
+        return ([], text) if text.strip() else ([{"image": None, "text": ""}], "")
     mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     if mime in IMAGE_MIME_BY_EXT.values() and limit > 0 and len(data) <= MAX_IMAGE_BYTES:
         return [{"image": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}", "text": ""}], ""
-    return [], ""
+    return [{"image": None, "text": ""}], ""
 
 
 def _describe_homework_question(q: HomeworkQuestion, has_model_image: bool = False) -> str:
@@ -387,7 +404,7 @@ def _clean_question_result(item: dict, q: HomeworkQuestion) -> dict:
         "selected_options": selected if q.type in CHOICE_TYPES else [],
         "confidence": confidence,
         "score": score,
-        "feedback": str(item.get("feedback") or "")[:500],
+        "feedback": str(item.get("feedback") or "").strip()[:300],
     }
 
 
@@ -451,8 +468,14 @@ def _ask_model(rules: str, prompt: str, images) -> dict:
     return json.loads(match.group(0) if match else raw)
 
 
+def _overall_feedback(reports, limit=2) -> str:
+    """The first distinct overall comments of the batches, kept short."""
+    notes = [n for n in dict.fromkeys(str(r.get("feedback") or "").strip() for r in reports) if n]
+    return " ".join(notes[:limit])[:500]
+
+
 def _run_all(jobs):
-    """jobs: list of (rules, prompt, images). Runs them in parallel; returns (reports, failed job count).
+    """jobs: list of (rules, prompt, images). Runs them in parallel and returns one result per job (None when it failed).
     A failed batch only leaves its questions for the teacher; if every batch fails the grading fails."""
     def run(job):
         try:
@@ -465,10 +488,10 @@ def _run_all(jobs):
     else:
         with ThreadPoolExecutor(max_workers=max(1, BATCH_WORKERS)) as pool:
             results = list(pool.map(run, jobs))
-    reports = [r for r in results if isinstance(r, dict)]
-    if jobs and not reports:
+    results = [r if isinstance(r, dict) else None for r in results]
+    if jobs and all(r is None for r in results):
         raise RuntimeError("every grading request to the AI model failed")
-    return reports, len(results) - len(reports)
+    return results
 
 
 def _page_batches(pages):
@@ -539,10 +562,11 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
     reads_paper = [q for q in req.questions if q.read_from_images]
     typed_only = [q for q in req.questions if not q.read_from_images]
 
-    jobs = []
+    jobs, job_pages = [], []
     if typed_only:
         jobs.append((HOMEWORK_TYPED_RULES,
                      header + "\n=== QUESTIONS ===\n" + listing(typed_only) + "\n=== END QUESTIONS ===", []))
+        job_pages.append(0)
 
     pages = sheet + question_pages
     if reads_paper and pages:
@@ -552,25 +576,26 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
                     f"whose answers appear on THESE pages.\n")
             prompt = header + note + "\n=== QUESTIONS ===\n" + listing(reads_paper) + "\n=== END QUESTIONS ===" + documents
             jobs.append((HOMEWORK_PAGE_RULES, prompt, [(_page_caption(p), p["image"]) for p in batch] + model_captions))
+            job_pages.append(len(batch))
     elif reads_paper:
         note = ("\nNote: the student's files could not be read; use confidence 'low' for answers that would be in them.\n"
                 if unreadable else "\n")
         jobs.append((HOMEWORK_PAGE_RULES if model_captions else HOMEWORK_TYPED_RULES,
                      header + note + "\n=== QUESTIONS ===\n" + listing(reads_paper) + "\n=== END QUESTIONS ===" + documents,
                      model_captions))
+        job_pages.append(0)
 
-    reports, failed = _run_all(jobs) if jobs else ([], 0)
-    feedback = " ".join(dict.fromkeys(str(r.get("feedback") or "").strip() for r in reports if r.get("feedback")))
-    if failed:
-        feedback = f"⚠ {failed} batch(es) could not be read by the AI. " + feedback
-    if skipped:
-        feedback = f"⏸ {skipped} page(s) not read. " + feedback
+    results = _run_all(jobs) if jobs else []
+    reports = [r for r in results if r is not None]
+    failed = len(results) - len(reports)
+    pages_read = sum(n for r, n in zip(results, job_pages) if r is not None)
+    feedback = _overall_feedback(reports)
     return {
         "questions": _merge_question_results(reports, req.questions),
         "score": None,
-        "feedback": feedback[:1000],
+        "feedback": feedback,
         "needs_review": skipped > 0 or unreadable or failed > 0,
-        "pages_read": len(pages),
+        "pages_read": pages_read,
         "pages_skipped": skipped,
     }
 
@@ -579,8 +604,8 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
     header = (f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
               f"Teacher instructions: {req.instructions or '-'}\n")
     pages = sheet + question_pages
+    batches = _page_batches(pages) if pages else []
     if pages:
-        batches = _page_batches(pages)
         jobs = [(HOMEWORK_UPLOAD_ONLY_RULES,
                  header + f"\nThese are batch {i} of {len(batches)} of the student's pages; list every question on them.\n" + documents,
                  [(_page_caption(p), p["image"]) for p in batch])
@@ -588,7 +613,10 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
     else:
         jobs = [(HOMEWORK_UPLOAD_ONLY_RULES, header + "\nThe student's work as text:\n" + (documents or "(nothing readable)"), [])]
 
-    reports, failed = _run_all(jobs)
+    results = _run_all(jobs)
+    reports = [r for r in results if r is not None]
+    failed = len(results) - len(reports)
+    pages_read = sum(len(b) for r, b in zip(results, batches) if r is not None)
     items, seen = [], set()
     for data in reports:
         for item in data.get("items") or []:
@@ -615,21 +643,17 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
     unsure = [i["label"] for i in items if i["correct"] is None or i["confidence"] != "high"]
     summary = f"✔ {right}/{len(items)}" if items else ""
     if wrong:
-        summary += " · ✘ " + ", ".join(wrong[:40])
+        summary += " · ✘ " + ", ".join(wrong[:15])
     if unsure:
-        summary += " · ? " + ", ".join(unsure[:40])
-    if skipped:
-        summary += f" · ⏸ {skipped} page(s) not read"
-    if failed:
-        summary += f" · ⚠ {failed} batch(es) failed"
-    model_feedback = " ".join(dict.fromkeys(str(r.get("feedback") or "").strip() for r in reports if r.get("feedback")))
+        summary += " · ? " + ", ".join(unsure[:15])
+    model_feedback = _overall_feedback(reports)
     return {
         "questions": [],
         "items": items,
         "score": score,
         "feedback": (summary + ("\n" if summary and model_feedback else "") + model_feedback)[:1500],
         "needs_review": not items or bool(unsure) or skipped > 0 or unreadable or failed > 0,
-        "pages_read": len(pages),
+        "pages_read": pages_read,
         "pages_skipped": skipped,
     }
 
