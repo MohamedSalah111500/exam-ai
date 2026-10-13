@@ -297,6 +297,204 @@ async def grade_homework(req: GradeHomeworkRequest):
         raise HTTPException(status_code=500, detail=f"Grading Error: {str(e)}")
 
 
+class HomeworkOption(BaseModel):
+    number: int
+    letter_ar: str = ""
+    letter_en: str = ""
+    text: str = ""
+
+
+class HomeworkQuestion(BaseModel):
+    id: int
+    number: int
+    # single | multi | truefalse | essay
+    type: str
+    body: str = ""
+    max_score: float = 1
+    options: List[HomeworkOption] = []
+    read_from_images: bool = False
+    student_text: Optional[str] = None
+    answer_by_upload: bool = False
+    model_answer: Optional[str] = None
+    model_answer_image_url: Optional[str] = None
+
+
+class GradeHomeworkV2Request(BaseModel):
+    homework_name: str
+    total_score: float
+    instructions: Optional[str] = None
+    questions: List[HomeworkQuestion] = []
+    file_urls: List[str] = []
+
+
+CHOICE_TYPES = {"single", "multi", "truefalse"}
+CONFIDENCE_LEVELS = {"high", "medium", "low"}
+MAX_MODEL_ANSWER_IMAGES = 4
+
+HOMEWORK_V2_RULES = (
+    "You are a careful teacher grading one student's homework.\n"
+    "The student may answer in the platform (typed text), or print the homework, solve it on paper and upload photos, or both.\n"
+    "Questions are numbered exactly as on the printed sheet. Options are labelled with Arabic letters (أ ب ج د ...) "
+    "or English letters (A B C D ...); both labels refer to the same option number.\n\n"
+    "For each question listed below:\n"
+    "- single / multi / truefalse: find in the student's images or documents which option(s) the student marked for that "
+    "question number (circled, ticked, underlined, shaded, or a written letter such as '3- ب' or an answer table). "
+    "Return them as option numbers in selected_options. Do NOT judge whether the choice is correct and set score to null. "
+    "If the student marked nothing for that question, return an empty list.\n"
+    "- essay: grade the student's answer (typed text and/or what is written or drawn in the images) from 0 to max_score. "
+    "Use the model answer when one is given. For drawings (triangles, graphs, diagrams) judge the drawing itself: correct shape, "
+    "labels, measurements and steps. Give partial credit for partially correct work.\n\n"
+    "confidence: 'high' only when the student's answer is clearly legible and unambiguous; 'medium' when it is probably right; "
+    "'low' when you are guessing or could not find the answer. Never invent an answer that is not visible.\n"
+    "feedback: one short sentence per question, written in the language of the questions.\n\n"
+    "Return ONLY a JSON object: "
+    "{\"questions\": [{\"id\": <question id>, \"selected_options\": [<option numbers>], \"confidence\": \"high|medium|low\", "
+    "\"score\": <number or null>, \"feedback\": \"...\"}], \"score\": <overall score or null>, \"feedback\": \"<short overall feedback>\"}"
+)
+
+HOMEWORK_UPLOAD_ONLY_RULES = (
+    "You are a careful teacher grading one student's homework that was submitted as uploaded files.\n"
+    "Grade the work against the teacher's instructions from 0 to the total score. Give partial credit where earned.\n"
+    "Return ONLY a JSON object: {\"questions\": [], \"score\": <number>, \"feedback\": \"<short feedback in the language of the instructions>\"}"
+)
+
+
+def _describe_homework_question(q: HomeworkQuestion, has_model_image: bool) -> str:
+    lines = [f"Question {q.number} (id={q.id}, type={q.type}, max_score={q.max_score}): {q.body}"]
+    for o in q.options:
+        lines.append(f"  option {o.number} [{o.letter_ar} / {o.letter_en}]: {o.text}")
+    if q.student_text:
+        lines.append(f"  Student typed answer: {q.student_text}")
+    if q.answer_by_upload:
+        lines.append("  This question is solved on paper; the answer is in the student's images.")
+    elif q.read_from_images and q.type in CHOICE_TYPES:
+        lines.append("  Not answered in the platform; read the marked option from the student's images.")
+    if q.model_answer:
+        lines.append(f"  Model answer: {q.model_answer}")
+    if has_model_image:
+        lines.append("  A model answer image for this question is attached and labelled.")
+    return "\n".join(lines)
+
+
+def _normalize_homework_result(data: dict, req: GradeHomeworkV2Request) -> dict:
+    by_id = {q.id: q for q in req.questions}
+    results = {}
+    for item in data.get("questions") or []:
+        try:
+            qid = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        q = by_id.get(qid)
+        if q is None or qid in results:
+            continue
+        valid_numbers = {o.number for o in q.options}
+        selected = []
+        for n in item.get("selected_options") or []:
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                continue
+            if n in valid_numbers and n not in selected:
+                selected.append(n)
+        confidence = str(item.get("confidence") or "low").strip().lower()
+        if confidence not in CONFIDENCE_LEVELS:
+            confidence = "low"
+        score = None
+        if q.type not in CHOICE_TYPES:
+            try:
+                score = max(0.0, min(float(item.get("score")), float(q.max_score)))
+            except (TypeError, ValueError):
+                score, confidence = 0.0, "low"
+        results[qid] = {
+            "id": qid,
+            "selected_options": selected if q.type in CHOICE_TYPES else [],
+            "confidence": confidence,
+            "score": score,
+            "feedback": str(item.get("feedback") or "")[:500],
+        }
+
+    for q in req.questions:
+        results.setdefault(q.id, {"id": q.id, "selected_options": [], "confidence": "low",
+                                  "score": None if q.type in CHOICE_TYPES else 0.0, "feedback": ""})
+
+    overall = None
+    if not req.questions:
+        try:
+            overall = max(0.0, min(float(data.get("score")), float(req.total_score)))
+        except (TypeError, ValueError):
+            overall = None
+
+    return {"questions": list(results.values()), "score": overall, "feedback": str(data.get("feedback") or "")[:1000]}
+
+
+@app.post("/grade-homework-v2")
+def grade_homework_v2(req: GradeHomeworkV2Request):
+    # Plain def: FastAPI runs it in its threadpool, so the slow downloads and model call never block other endpoints.
+    image_urls = [u for u in (req.file_urls or []) if _url_ext(u) in IMAGE_MIME_BY_EXT]
+    doc_urls = [u for u in (req.file_urls or []) if _url_ext(u) not in IMAGE_MIME_BY_EXT]
+
+    documents = ""
+    for u in doc_urls:
+        text = _extract_file_text(u)
+        if text.strip():
+            documents += f"\n\n[Student document]\n{text[:6000]}"
+
+    student_images = []
+    model_images = []
+    if vision_client is not None:
+        student_images = [d for d in (_image_data_url(u) for u in image_urls[:MAX_GRADED_IMAGES]) if d]
+        for q in req.questions:
+            if q.model_answer_image_url and len(model_images) < MAX_MODEL_ANSWER_IMAGES:
+                d = _image_data_url(q.model_answer_image_url)
+                if d:
+                    model_images.append((q.number, d))
+
+    if req.questions:
+        rules = HOMEWORK_V2_RULES
+        with_model_image = {number for number, _ in model_images}
+        listing = "\n\n".join(_describe_homework_question(q, q.number in with_model_image) for q in req.questions)
+    else:
+        rules = HOMEWORK_UPLOAD_ONLY_RULES
+        listing = "(no questions; grade the uploaded work as a whole)"
+
+    prompt = (
+        f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
+        f"Teacher instructions: {req.instructions or '-'}\n\n"
+        f"=== QUESTIONS ===\n{listing}\n=== END QUESTIONS ==={documents}"
+    )
+    if image_urls and not student_images:
+        prompt += "\n\nNote: the student's images could not be read; use confidence 'low' for answers that would be in them."
+
+    try:
+        if student_images or model_images:
+            content = [{"type": "text", "text": prompt}]
+            for i, d in enumerate(student_images, start=1):
+                content.append({"type": "text", "text": f"Student image {i}:"})
+                content.append({"type": "image_url", "image_url": {"url": d}})
+            for number, d in model_images:
+                content.append({"type": "text", "text": f"Model answer image for question {number} (teacher's reference, not the student's work):"})
+                content.append({"type": "image_url", "image_url": {"url": d}})
+            response = vision_client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=[{"role": "system", "content": rules}, {"role": "user", "content": content}],
+                temperature=0.1,
+            )
+        else:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "system", "content": rules}, {"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+
+        raw = response.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(match.group(0) if match else raw)
+        return _normalize_homework_result(data, req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Grading Error: {str(e)}")
+
+
 # ----------------------------------------------------------------------
 # Student chatbot
 # This service is called server-to-server by PlatX (.NET), NOT by the
