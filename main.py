@@ -351,6 +351,8 @@ class HomeworkQuestion(BaseModel):
     answer_by_upload: bool = False
     model_answer: Optional[str] = None
     model_answer_image_url: Optional[str] = None
+    # Files the student attached to this question only.
+    file_urls: List[str] = []
 
 
 class GradeHomeworkV2Request(BaseModel):
@@ -364,6 +366,7 @@ class GradeHomeworkV2Request(BaseModel):
 CHOICE_TYPES = {"single", "multi", "truefalse"}
 CONFIDENCE_LEVELS = {"high", "medium", "low"}
 MAX_MODEL_ANSWER_IMAGES = 4
+MAX_QUESTION_IMAGES = 10
 
 HOMEWORK_V2_RULES = (
     "You are a careful teacher grading one student's homework.\n"
@@ -393,14 +396,19 @@ HOMEWORK_UPLOAD_ONLY_RULES = (
 )
 
 
-def _describe_homework_question(q: HomeworkQuestion, has_model_image: bool) -> str:
+def _describe_homework_question(q: HomeworkQuestion, has_model_image: bool, own_files: int = 0,
+                                skipped_files: bool = False, has_sheet: bool = False) -> str:
     lines = [f"Question {q.number} (id={q.id}, type={q.type}, max_score={q.max_score}): {q.body}"]
     for o in q.options:
         lines.append(f"  option {o.number} [{o.letter_ar} / {o.letter_en}]: {o.text}")
     if q.student_text:
         lines.append(f"  Student typed answer: {q.student_text}")
-    if q.answer_by_upload:
-        lines.append("  This question is solved on paper; the answer is in the student's images.")
+    if own_files:
+        lines.append(f"  The student attached {own_files} file(s) for this question only, labelled 'Answer for question {q.number}'. Read the answer from them first.")
+    elif q.answer_by_upload and has_sheet:
+        lines.append("  The student may have answered this question on paper; look for it in the student's images.")
+    if skipped_files:
+        lines.append("  Some of the student's files for this question could not be attached; use confidence 'low' unless the answer is clearly visible.")
     elif q.read_from_images and q.type in CHOICE_TYPES:
         lines.append("  Not answered in the platform; read the marked option from the student's images.")
     if q.model_answer:
@@ -467,6 +475,30 @@ def grade_homework_v2(req: GradeHomeworkV2Request):
     image_urls = [u for u in (req.file_urls or []) if _url_ext(u) in IMAGE_MIME_BY_EXT]
     doc_urls = [u for u in (req.file_urls or []) if _url_ext(u) not in IMAGE_MIME_BY_EXT]
 
+    question_images = []  # (question number, data url)
+    question_texts = ""
+    own_file_count = {}
+    skipped = set()
+    for q in req.questions:
+        for u in q.file_urls:
+            room = MAX_QUESTION_IMAGES - len(question_images) if vision_client is not None else 0
+            if _url_ext(u) in IMAGE_MIME_BY_EXT:
+                d = _image_data_url(u) if room > 0 else None
+                if d:
+                    question_images.append((q.number, d))
+                    own_file_count[q.number] = own_file_count.get(q.number, 0) + 1
+                else:
+                    skipped.add(q.number)
+                continue
+            text, pages = _read_document(u, max(0, room))
+            question_images.extend((q.number, page) for page in pages)
+            if pages or text.strip():
+                own_file_count[q.number] = own_file_count.get(q.number, 0) + max(1, len(pages))
+            else:
+                skipped.add(q.number)
+            if text.strip():
+                question_texts += f"\n\n[Answer for question {q.number} (document text)]\n{text[:3000]}"
+
     student_images = []
     if vision_client is not None:
         student_images = [d for d in (_image_data_url(u) for u in image_urls[:MAX_GRADED_IMAGES]) if d]
@@ -491,7 +523,10 @@ def grade_homework_v2(req: GradeHomeworkV2Request):
     if req.questions:
         rules = HOMEWORK_V2_RULES
         with_model_image = {number for number, _ in model_images}
-        listing = "\n\n".join(_describe_homework_question(q, q.number in with_model_image) for q in req.questions)
+        has_sheet = bool(student_images or document_pages or documents)
+        listing = "\n\n".join(
+            _describe_homework_question(q, q.number in with_model_image, own_file_count.get(q.number, 0),
+                                        q.number in skipped, has_sheet) for q in req.questions)
     else:
         rules = HOMEWORK_UPLOAD_ONLY_RULES
         listing = "(no questions; grade the uploaded work as a whole)"
@@ -499,14 +534,19 @@ def grade_homework_v2(req: GradeHomeworkV2Request):
     prompt = (
         f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
         f"Teacher instructions: {req.instructions or '-'}\n\n"
-        f"=== QUESTIONS ===\n{listing}\n=== END QUESTIONS ==={documents}"
+        f"=== QUESTIONS ===\n{listing}\n=== END QUESTIONS ==={question_texts}{documents}"
     )
-    if (image_urls or doc_urls) and not student_images and not document_pages and not documents:
+    has_question_files = any(q.file_urls for q in req.questions)
+    if (image_urls or doc_urls or has_question_files) and not student_images and not document_pages and not documents \
+            and not question_images and not question_texts:
         prompt += "\n\nNote: the student's files could not be read; use confidence 'low' for answers that would be in them."
 
     try:
-        if student_images or document_pages or model_images:
+        if student_images or document_pages or model_images or question_images:
             content = [{"type": "text", "text": prompt}]
+            for number, d in question_images:
+                content.append({"type": "text", "text": f"Answer for question {number} (attached by the student to this question):"})
+                content.append({"type": "image_url", "image_url": {"url": d}})
             for i, d in enumerate(student_images, start=1):
                 content.append({"type": "text", "text": f"Student image {i}:"})
                 content.append({"type": "image_url", "image_url": {"url": d}})
