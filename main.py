@@ -3,6 +3,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import PyPDF2
+import pymupdf
 import docx2txt
 from openai import OpenAI
 import os
@@ -222,21 +223,54 @@ def _parse_grade(raw: str, total_score: float) -> dict:
     return {"score": max(0.0, min(score, float(total_score))), "feedback": data.get("feedback", "")}
 
 
-def _extract_file_text(url: str) -> str:
-    """Download a PDF/Word file and return its text (best-effort)."""
+PDF_PAGE_DPI = 150
+
+
+def _read_document(url: str, max_page_images: int = 0):
+    """Download a PDF/Word file and return (text, page images as data URLs).
+
+    PDF pages are also rendered as images, annotations included, so handwriting, drawings and
+    marks added on top of the printed sheet reach the vision model; text extraction alone misses them.
+    """
     try:
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         data = resp.content
-        lower = url.lower()
-        if lower.endswith(".pdf"):
-            reader = PyPDF2.PdfReader(io.BytesIO(data))
-            return "".join(page.extract_text() or "" for page in reader.pages)
-        if lower.endswith(".docx"):
-            return docx2txt.process(io.BytesIO(data)) or ""
     except Exception:
-        return ""
-    return ""
+        return "", []
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    ext = _url_ext(url)
+    if data[:4] == b"%PDF" or ext == ".pdf" or "pdf" in ctype:
+        text = ""
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(data))
+            text = "".join(page.extract_text() or "" for page in reader.pages)
+        except Exception:
+            pass
+        images = []
+        if max_page_images > 0:
+            try:
+                with pymupdf.open(stream=data, filetype="pdf") as doc:
+                    for page in doc:
+                        if len(images) >= max_page_images:
+                            break
+                        pix = page.get_pixmap(dpi=PDF_PAGE_DPI, annots=True)
+                        images.append("data:image/jpeg;base64," + base64.b64encode(pix.tobytes("jpeg", jpg_quality=85)).decode("ascii"))
+            except Exception:
+                images = []
+        return text, images
+    if ext == ".docx" or data[:2] == b"PK":
+        try:
+            return docx2txt.process(io.BytesIO(data)) or "", []
+        except Exception:
+            return "", []
+    return "", []
+
+
+def _extract_file_text(url: str) -> str:
+    """Download a PDF/Word file and return its text (best-effort)."""
+    return _read_document(url)[0]
 
 
 @app.post("/grade-homework")
@@ -433,16 +467,21 @@ def grade_homework_v2(req: GradeHomeworkV2Request):
     image_urls = [u for u in (req.file_urls or []) if _url_ext(u) in IMAGE_MIME_BY_EXT]
     doc_urls = [u for u in (req.file_urls or []) if _url_ext(u) not in IMAGE_MIME_BY_EXT]
 
-    documents = ""
-    for u in doc_urls:
-        text = _extract_file_text(u)
-        if text.strip():
-            documents += f"\n\n[Student document]\n{text[:6000]}"
-
     student_images = []
-    model_images = []
     if vision_client is not None:
         student_images = [d for d in (_image_data_url(u) for u in image_urls[:MAX_GRADED_IMAGES]) if d]
+
+    documents = ""
+    document_pages = []
+    for u in doc_urls:
+        room = MAX_GRADED_IMAGES - len(student_images) - len(document_pages) if vision_client is not None else 0
+        text, pages = _read_document(u, max(0, room))
+        document_pages.extend(pages)
+        if text.strip():
+            documents += f"\n\n[Student document text]\n{text[:6000]}"
+
+    model_images = []
+    if vision_client is not None:
         for q in req.questions:
             if q.model_answer_image_url and len(model_images) < MAX_MODEL_ANSWER_IMAGES:
                 d = _image_data_url(q.model_answer_image_url)
@@ -462,14 +501,17 @@ def grade_homework_v2(req: GradeHomeworkV2Request):
         f"Teacher instructions: {req.instructions or '-'}\n\n"
         f"=== QUESTIONS ===\n{listing}\n=== END QUESTIONS ==={documents}"
     )
-    if image_urls and not student_images:
-        prompt += "\n\nNote: the student's images could not be read; use confidence 'low' for answers that would be in them."
+    if (image_urls or doc_urls) and not student_images and not document_pages and not documents:
+        prompt += "\n\nNote: the student's files could not be read; use confidence 'low' for answers that would be in them."
 
     try:
-        if student_images or model_images:
+        if student_images or document_pages or model_images:
             content = [{"type": "text", "text": prompt}]
             for i, d in enumerate(student_images, start=1):
                 content.append({"type": "text", "text": f"Student image {i}:"})
+                content.append({"type": "image_url", "image_url": {"url": d}})
+            for i, d in enumerate(document_pages, start=1):
+                content.append({"type": "text", "text": f"Student PDF page {i} (look for handwriting, drawings and marks on it):"})
                 content.append({"type": "image_url", "image_url": {"url": d}})
             for number, d in model_images:
                 content.append({"type": "text", "text": f"Model answer image for question {number} (teacher's reference, not the student's work):"})
