@@ -247,6 +247,8 @@ class GradeHomeworkV2Request(BaseModel):
     homework_name: str
     total_score: float
     instructions: Optional[str] = None
+    # How the teacher wants the work marked (e.g. "give marks for the steps"); never shown to the student.
+    grading_instructions: Optional[str] = None
     questions: List[HomeworkQuestion] = []
     file_urls: List[str] = []
     # Pages (PDF pages or photos) the academy's AI credit pays for; set by PlatX.
@@ -314,10 +316,12 @@ HOMEWORK_UPLOAD_ONLY_RULES = (
     "For each item: label = how it is identified on the paper (include the section if numbering restarts, e.g. 'Type 2 - 3'); "
     "page = the page number given in the page caption; student_answer = what the student marked or wrote (e.g. 'B' or a short "
     "summary); correct = true / false after you solve the question yourself, or null if the student left it unanswered or you "
-    "cannot decide; confidence = 'high' only when both the student's mark and the correct answer are clear, otherwise 'medium' or 'low'.\n"
-    "Follow the teacher's instructions when they give an answer key or marking rules.\n"
+    "cannot decide; credit = the share of this item's marks the student earned, from 0 to 1 (1 when fully correct, 0 when "
+    "wrong or blank, in between for partly correct work such as right steps with a wrong final answer); confidence = 'high' "
+    "only when both the student's mark and the correct answer are clear, otherwise 'medium' or 'low'.\n"
+    "Follow the teacher's instructions and grading instructions when they give an answer key or marking rules.\n"
     "Return ONLY a JSON object: {\"items\": [{\"label\": \"...\", \"page\": <number>, \"student_answer\": \"...\", "
-    "\"correct\": true|false|null, \"confidence\": \"high|medium|low\"}], \"strengths\": \"...\", \"to_review\": \"...\"}\n"
+    "\"correct\": true|false|null, \"credit\": <0 to 1>, \"confidence\": \"high|medium|low\"}], \"strengths\": \"...\", \"to_review\": \"...\"}\n"
     "strengths and to_review are read by the student: write them ONLY in the feedback language given in the request, as one "
     "short plain sentence each (no markdown, lists, emojis or line breaks, no greetings or empty praise): what the student "
     "did well, and the one thing to review most, naming its question labels. Leave one empty if there is nothing to say."
@@ -339,6 +343,20 @@ FEEDBACK_LABELS = {
 
 def _language_code(language: Optional[str]) -> str:
     return (language or "").strip().lower().replace("_", "-").split("-")[0]
+
+
+MAX_GRADING_INSTRUCTIONS = 2000
+
+
+def _homework_header(req: GradeHomeworkV2Request) -> str:
+    header = (f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
+              f"Teacher instructions: {req.instructions or '-'}\n")
+    grading = (req.grading_instructions or "").strip()[:MAX_GRADING_INSTRUCTIONS]
+    if grading:
+        header += ("=== TEACHER'S GRADING INSTRUCTIONS ===\n" + grading + "\n=== END GRADING INSTRUCTIONS ===\n"
+                   "Apply the teacher's grading instructions when deciding scores, partial credit and feedback. They never "
+                   "change the JSON format, the score limits or the rule against inventing answers that are not visible.\n")
+    return header + _language_instruction(req.language)
 
 
 def _language_instruction(language: Optional[str]) -> str:
@@ -606,8 +624,7 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
     model_captions = [(f"Model answer image for platform question number {n} (teacher's reference, not the student's work):", d)
                       for n, d in model_images]
 
-    header = (f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
-              f"Teacher instructions: {req.instructions or '-'}\n" + _language_instruction(req.language))
+    header = _homework_header(req)
 
     def listing(questions):
         return "\n\n".join(_describe_homework_question(q, q.number in with_model_image) for q in questions)
@@ -652,9 +669,14 @@ def _grade_questions(req: GradeHomeworkV2Request, sheet, question_pages, documen
     }
 
 
+def _item_credit(credit, correct) -> float:
+    if isinstance(credit, (int, float)) and not isinstance(credit, bool):
+        return min(max(float(credit), 0.0), 1.0)
+    return 1.0 if correct is True else 0.0
+
+
 def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, documents, skipped, unreadable) -> dict:
-    header = (f"Homework: {req.homework_name}\nTotal score: {req.total_score}\n"
-              f"Teacher instructions: {req.instructions or '-'}\n" + _language_instruction(req.language))
+    header = _homework_header(req)
     pages = sheet + question_pages
     batches = _page_batches(pages) if pages else []
     if pages:
@@ -685,12 +707,14 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
                 "page": item.get("page"),
                 "student_answer": str(item.get("student_answer") or "")[:200],
                 "correct": correct if isinstance(correct, bool) else None,
+                "credit": _item_credit(item.get("credit"), correct),
                 "confidence": confidence if confidence in CONFIDENCE_LEVELS else "low",
             })
 
     right = sum(1 for i in items if i["correct"] is True)
     complete = items and not skipped and not failed
-    score = round(float(req.total_score) * right / len(items), 2) if complete else None
+    earned = sum(i["credit"] for i in items)
+    score = round(float(req.total_score) * earned / len(items), 2) if complete else None
     unsure = [i["label"] for i in items if i["correct"] is None or i["confidence"] != "high"]
     wrong = [i["label"] for i in items if i["correct"] is False and i["confidence"] == "high"]
     labels = _labels(req.language)
