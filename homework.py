@@ -36,7 +36,7 @@ VISION_MODEL = os.environ.get('VISION_MODEL', 'deepseek-flash')
 
 # Homework grading has its own key, endpoint and model; every setting falls back to the shared DeepSeek / vision ones.
 HOMEWORK_API_KEY = os.environ.get('HOMEWORK_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
-HOMEWORK_TEXT_MODEL = os.environ.get('HOMEWORK_TEXT_MODEL', 'deepseek-chat')
+HOMEWORK_TEXT_MODEL = os.environ.get('HOMEWORK_TEXT_MODEL', 'deepseek-flash')
 HOMEWORK_CALL_TIMEOUT = float(os.environ.get('HOMEWORK_CALL_TIMEOUT', '150'))
 homework_text_client = OpenAI(
     api_key=HOMEWORK_API_KEY,

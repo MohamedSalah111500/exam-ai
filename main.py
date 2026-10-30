@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from homework import router as homework_router
 
 # إعداد العميل لـ DeepSeek
+CHAT_MODEL = os.environ.get('CHAT_MODEL', 'deepseek-flash')
 client = OpenAI(
     api_key=os.environ.get('DEEPSEEK_API_KEY'),
     base_url="https://api.deepseek.com"
@@ -30,7 +31,7 @@ stt_client = OpenAI(api_key=STT_API_KEY, base_url=STT_BASE_URL) if STT_API_KEY e
 
 # Exam generation has its own key, endpoint and model; homework grading lives in homework.py with its own API.
 EXAM_API_KEY = os.environ.get('EXAM_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
-EXAM_MODEL = os.environ.get('EXAM_MODEL', 'deepseek-chat')
+EXAM_MODEL = os.environ.get('EXAM_MODEL', 'deepseek-flash')
 exam_client = OpenAI(api_key=EXAM_API_KEY, base_url=os.environ.get('EXAM_BASE_URL', 'https://api.deepseek.com')) if EXAM_API_KEY else None
 
 
@@ -227,7 +228,7 @@ async def chat(req: ChatRequest):
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=CHAT_MODEL,
             messages=messages,
             temperature=0.2,
         )
@@ -310,7 +311,7 @@ def crm_insights(req: CrmInsightsRequest):
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=CHAT_MODEL,
             messages=messages,
             temperature=0.2,
         )
@@ -447,7 +448,7 @@ async def voice_student(
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": VOICE_STUDENT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
