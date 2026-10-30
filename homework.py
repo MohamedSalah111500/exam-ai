@@ -25,18 +25,17 @@ from fastapi import APIRouter, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 
+from config import DEEPSEEK_MODEL
 from office_reader import describe_office, office_kind
 
 router = APIRouter()
 
-# Shared vision defaults (DeepSeek's multimodal model); HOMEWORK_VISION_* below can override them.
+# Shared vision defaults; HOMEWORK_VISION_* below can override the key and endpoint. Every call uses DEEPSEEK_MODEL.
 VISION_API_KEY = os.environ.get('VISION_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
 VISION_BASE_URL = os.environ.get('VISION_BASE_URL', 'https://api.deepseek.com')
-VISION_MODEL = os.environ.get('VISION_MODEL', 'deepseek-flash')
 
-# Homework grading has its own key, endpoint and model; every setting falls back to the shared DeepSeek / vision ones.
+# Homework grading has its own key and endpoint; every setting falls back to the shared DeepSeek / vision ones.
 HOMEWORK_API_KEY = os.environ.get('HOMEWORK_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
-HOMEWORK_TEXT_MODEL = os.environ.get('HOMEWORK_TEXT_MODEL', 'deepseek-flash')
 HOMEWORK_CALL_TIMEOUT = float(os.environ.get('HOMEWORK_CALL_TIMEOUT', '150'))
 homework_text_client = OpenAI(
     api_key=HOMEWORK_API_KEY,
@@ -45,7 +44,6 @@ homework_text_client = OpenAI(
     max_retries=1,
 ) if HOMEWORK_API_KEY else None
 HOMEWORK_VISION_API_KEY = os.environ.get('HOMEWORK_VISION_API_KEY') or os.environ.get('HOMEWORK_API_KEY') or VISION_API_KEY
-HOMEWORK_VISION_MODEL = os.environ.get('HOMEWORK_VISION_MODEL', VISION_MODEL)
 homework_vision_client = OpenAI(
     api_key=HOMEWORK_VISION_API_KEY,
     base_url=os.environ.get('HOMEWORK_VISION_BASE_URL') or VISION_BASE_URL,
@@ -202,7 +200,7 @@ def grade_homework(req: GradeHomeworkRequest):
             content = [{"type": "text", "text": base_instruction + image_hint}]
             content += [{"type": "image_url", "image_url": {"url": d}} for d in images]
             response = homework_vision_client.chat.completions.create(
-                model=HOMEWORK_VISION_MODEL,
+                model=DEEPSEEK_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a professional teacher. Return valid JSON only."},
                     {"role": "user", "content": content},
@@ -214,7 +212,7 @@ def grade_homework(req: GradeHomeworkRequest):
             if image_urls:
                 note = "\n\nNote: the student uploaded image files that could not be read automatically; grade what is available and mention that images need teacher review."
             response = homework_text_client.chat.completions.create(
-                model=HOMEWORK_TEXT_MODEL,
+                model=DEEPSEEK_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a professional teacher. Return valid JSON only."},
                     {"role": "user", "content": base_instruction + note},
@@ -553,13 +551,13 @@ def _ask_model(rules: str, prompt: str, images) -> dict:
             content.append({"type": "text", "text": caption})
             content.append({"type": "image_url", "image_url": {"url": d}})
         response = homework_vision_client.chat.completions.create(
-            model=HOMEWORK_VISION_MODEL,
+            model=DEEPSEEK_MODEL,
             messages=[{"role": "system", "content": rules}, {"role": "user", "content": content}],
             temperature=0.1,
         )
     else:
         response = homework_text_client.chat.completions.create(
-            model=HOMEWORK_TEXT_MODEL,
+            model=DEEPSEEK_MODEL,
             messages=[{"role": "system", "content": rules}, {"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.1,
