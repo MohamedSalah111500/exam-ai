@@ -8,3 +8,6 @@ httpx
 requests
 pydantic
 pymupdf
+python-docx
+openpyxl
+python-pptx

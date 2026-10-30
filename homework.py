@@ -25,6 +25,8 @@ from fastapi import APIRouter, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 
+from office_reader import describe_office, office_kind
+
 router = APIRouter()
 
 # Shared vision defaults (DeepSeek's multimodal model); HOMEWORK_VISION_* below can override them.
@@ -148,12 +150,19 @@ def _read_document(url: str, max_page_images: int = 0):
             except Exception:
                 images = []
         return text, images
-    if ext == ".docx" or data[:2] == b"PK":
-        try:
-            return docx2txt.process(io.BytesIO(data)) or "", []
-        except Exception:
-            return "", []
+    if office_kind(data):
+        return _office_text(data), []
     return "", []
+
+
+def _office_text(data: bytes) -> str:
+    report = describe_office(data)
+    if report or office_kind(data) != "docx":
+        return report
+    try:
+        return docx2txt.process(io.BytesIO(data)) or ""
+    except Exception:
+        return ""
 
 
 def _extract_file_text(url: str) -> str:
@@ -297,31 +306,49 @@ HOMEWORK_V2_RULES = (
     "\"strengths\": \"...\", \"to_review\": \"...\"}"
 )
 
+OFFICE_FILE_RULES = (
+    "Student Word, Excel and PowerPoint files are given as an inspection report of what is really inside the file: the text "
+    "with the formatting applied to it in {..}, paragraph styles, alignment and lists, tables, pictures, each cell's value or "
+    "formula ('=...' is a formula, a plain number was typed by hand), cell formatting, borders, merged cells, charts, page "
+    "setup, and every slide with its layout and shapes. When an exercise asks the student to DO something in the program "
+    "(format text, apply a style, build a list or table, write a formula or function, format cells, sort, add a chart, "
+    "design slides), give credit only when the report shows it was done in the file: explaining in words how to do it is "
+    "not doing it, and a result typed by hand where a formula or function was asked is not a formula. If the report cannot "
+    "show a detail (for example the exact chart style or an animation's type), do not mark the work wrong for that detail "
+    "alone; lower the confidence instead. If the exercise only asks for written answers, grade the written content.\n"
+)
+
 HOMEWORK_PAGE_RULES = HOMEWORK_V2_RULES + (
     "\n\nThe attached images are some of the student's pages (photos or PDF pages). Look at EVERY attached page from top to "
     "bottom; a page may hold several questions, and an answer table may hold the answers of many questions. Report only the "
     "questions that appear on THESE pages (their text, or the student's answer to them, e.g. in an answer table); leave out "
-    "questions that do not appear on them."
+    "questions that do not appear on them.\n\n" + OFFICE_FILE_RULES
 )
 
 HOMEWORK_TYPED_RULES = HOMEWORK_V2_RULES + (
-    "\n\nThere are no images: grade EVERY listed question from the student's typed answer and report all of them."
+    "\n\nThere are no images: grade EVERY listed question from the student's typed answer and the student's files, "
+    "and report all of them.\n\n" + OFFICE_FILE_RULES
 )
 
 HOMEWORK_UPLOAD_ONLY_RULES = (
-    "You are a careful teacher grading one student's homework that was submitted as uploaded pages.\n"
-    "Go through EVERY attached page from top to bottom and list EVERY question or exercise you find, without skipping any.\n"
+    "You are a careful teacher grading one student's homework that was submitted as uploaded files.\n"
+    "Go through EVERY attached page and every student file from top to bottom and list EVERY question or exercise you find, "
+    "without skipping any. When a file holds both the exercise list and the student's work (for example a question table "
+    "next to the data in a workbook), list each exercise and grade it from the work in the file.\n"
     "List a question only on the page where its question text starts; if a question started on a page that is not attached, "
     "do not list it.\n"
     "For each item: label = how it is identified on the paper (include the section if numbering restarts, e.g. 'Type 2 - 3'); "
     "page = the page number given in the page caption; student_answer = what the student marked or wrote (e.g. 'B' or a short "
-    "summary); correct = true / false after you solve the question yourself, or null if the student left it unanswered or you "
-    "cannot decide; credit = the share of this item's marks the student earned, from 0 to 1 (1 when fully correct, 0 when "
-    "wrong or blank, in between for partly correct work such as right steps with a wrong final answer); confidence = 'high' "
+    "summary); correct = true / false after you solve the question yourself (false when the student left it unanswered or did "
+    "not do it), or null only when you cannot decide; credit = the share of this item's marks the student earned, from 0 to 1 (1 when fully correct, 0 when "
+    "wrong or blank, in between for partly correct work such as right steps with a wrong final answer); marks = how many "
+    "marks the item is worth when the paper or the teacher's grading instructions say so, otherwise null; confidence = 'high' "
     "only when both the student's mark and the correct answer are clear, otherwise 'medium' or 'low'.\n"
     "Follow the teacher's instructions and grading instructions when they give an answer key or marking rules.\n"
+    + OFFICE_FILE_RULES +
     "Return ONLY a JSON object: {\"items\": [{\"label\": \"...\", \"page\": <number>, \"student_answer\": \"...\", "
-    "\"correct\": true|false|null, \"credit\": <0 to 1>, \"confidence\": \"high|medium|low\"}], \"strengths\": \"...\", \"to_review\": \"...\"}\n"
+    "\"correct\": true|false|null, \"credit\": <0 to 1>, \"marks\": <number or null>, \"confidence\": \"high|medium|low\"}], "
+    "\"strengths\": \"...\", \"to_review\": \"...\"}\n"
     "strengths and to_review are read by the student: write them ONLY in the feedback language given in the request, as one "
     "short plain sentence each (no markdown, lists, emojis or line breaks, no greetings or empty praise): what the student "
     "did well, and the one thing to review most, naming its question labels. Leave one empty if there is nothing to say."
@@ -428,11 +455,8 @@ def _student_pages(url: str, limit: int):
         except Exception:
             return [{"image": None, "text": ""}], ""
         return pages or [{"image": None, "text": ""}], ""
-    if _url_ext(url) == ".docx" or data[:2] == b"PK":
-        try:
-            text = (docx2txt.process(io.BytesIO(data)) or "")[:12000]
-        except Exception:
-            text = ""
+    if office_kind(data):
+        text = _office_text(data)
         return ([], text) if text.strip() else ([{"image": None, "text": ""}], "")
     mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     if mime in IMAGE_MIME_BY_EXT.values() and limit > 0 and len(data) <= MAX_IMAGE_BYTES:
@@ -675,17 +699,32 @@ def _item_credit(credit, correct) -> float:
     return 1.0 if correct is True else 0.0
 
 
+def _item_marks(value) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
+def _weighted_share(items) -> float:
+    """Share of the homework earned: each item weighs its stated marks; items without marks weigh the average stated
+    mark (or 1 when no item states marks)."""
+    stated = [i["marks"] for i in items if i["marks"] is not None]
+    fallback = sum(stated) / len(stated) if stated else 1.0
+    weights = [i["marks"] if i["marks"] is not None else fallback for i in items]
+    return sum(i["credit"] * w for i, w in zip(items, weights)) / sum(weights)
+
+
 def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, documents, skipped, unreadable) -> dict:
     header = _homework_header(req)
     pages = sheet + question_pages
     batches = _page_batches(pages) if pages else []
-    if pages:
-        jobs = [(HOMEWORK_UPLOAD_ONLY_RULES,
-                 header + f"\nThese are batch {i} of {len(batches)} of the student's pages; list every question on them.\n" + documents,
-                 [(_page_caption(p), p["image"]) for p in batch])
-                for i, batch in enumerate(batches, start=1)]
-    else:
-        jobs = [(HOMEWORK_UPLOAD_ONLY_RULES, header + "\nThe student's work as text:\n" + (documents or "(nothing readable)"), [])]
+    jobs = [(HOMEWORK_UPLOAD_ONLY_RULES,
+             header + f"\nThese are batch {i} of {len(batches)} of the student's pages; list every question on them.\n",
+             [(_page_caption(p), p["image"]) for p in batch])
+            for i, batch in enumerate(batches, start=1)]
+    if documents or not pages:
+        jobs.append((HOMEWORK_UPLOAD_ONLY_RULES,
+                     header + "\nThe student's files (list every question or exercise in them):" + (documents or "\n(nothing readable)"), []))
 
     results = _run_all(jobs)
     reports = [r for r in results if r is not None]
@@ -697,7 +736,7 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
             label = _clean_text(item.get("label"), 60)
             page = item.get("page")
             key = (label.lower(), str(page))
-            if not label or (page is not None and key in seen):
+            if not label or key in seen:
                 continue
             seen.add(key)
             confidence = str(item.get("confidence") or "low").strip().lower()
@@ -708,13 +747,13 @@ def _grade_upload_only(req: GradeHomeworkV2Request, sheet, question_pages, docum
                 "student_answer": str(item.get("student_answer") or "")[:200],
                 "correct": correct if isinstance(correct, bool) else None,
                 "credit": _item_credit(item.get("credit"), correct),
+                "marks": _item_marks(item.get("marks")),
                 "confidence": confidence if confidence in CONFIDENCE_LEVELS else "low",
             })
 
     right = sum(1 for i in items if i["correct"] is True)
     complete = items and not skipped and not failed
-    earned = sum(i["credit"] for i in items)
-    score = round(float(req.total_score) * earned / len(items), 2) if complete else None
+    score = round(float(req.total_score) * _weighted_share(items), 2) if complete else None
     unsure = [i["label"] for i in items if i["correct"] is None or i["confidence"] != "high"]
     wrong = [i["label"] for i in items if i["correct"] is False and i["confidence"] == "high"]
     labels = _labels(req.language)
