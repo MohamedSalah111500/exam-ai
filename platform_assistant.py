@@ -16,6 +16,7 @@ _client = OpenAI(api_key=_API_KEY, base_url=os.environ.get('ASSISTANT_BASE_URL',
 
 MAX_ANSWER_TOKENS = 400
 MAX_ANSWER_CHARS = 1200
+MAX_ATTEMPTS = 2
 TOUR_ID_PATTERN = re.compile(r'^[a-z0-9-]{1,64}$')
 
 SYSTEM_PROMPT = (
@@ -43,7 +44,8 @@ SYSTEM_PROMPT = (
     "including how to go back and fix a step they forgot.\n"
     "- When one of the tours listed in the KNOWLEDGE shows exactly how to do what they asked, put its id "
     "in \"tour\"; otherwise leave it empty. Never return an owner-only tour when the role is 'assistant'.\n"
-    "- Reply in the user's language. For Arabic use simple, clear Modern Standard Arabic. Quote button "
+    "- Reply in the user's language. For Arabic always use simple, clear Modern Standard Arabic, even when "
+    "the user writes in a dialect. Quote button "
     "and menu names exactly as written in the KNOWLEDGE.\n"
     "- Be short: at most 5 short lines or numbered steps. Plain text, no markdown symbols.\n"
     "\n"
@@ -99,17 +101,24 @@ def platform_assistant(req: AssistantRequest):
             messages.append({"role": m.role, "content": m.content.strip()[:1000]})
     messages.append({"role": "user", "content": f"{_context_line(req)}\nQUESTION: {question[:500]}"})
 
-    try:
-        response = _client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=MAX_ANSWER_TOKENS,
-        )
-        data = json.loads(response.choices[0].message.content.strip())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Assistant Error: {str(e)}")
+    data = None
+    last_error = None
+    for _ in range(MAX_ATTEMPTS):
+        try:
+            response = _client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=MAX_ANSWER_TOKENS,
+            )
+            data = json.loads((response.choices[0].message.content or "").strip())
+            if isinstance(data, dict):
+                break
+        except Exception as e:
+            last_error = e
+    if data is None and last_error is not None:
+        raise HTTPException(status_code=500, detail=f"Assistant Error: {str(last_error)}")
 
     if not isinstance(data, dict):
         raise HTTPException(status_code=500, detail="EMPTY_ANSWER")
