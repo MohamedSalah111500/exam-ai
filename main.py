@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from config import DEEPSEEK_MODEL
 from homework import router as homework_router
 from platform_assistant import router as platform_assistant_router
+from ai_writing import router as ai_writing_router
 
 # إعداد العميل لـ DeepSeek
 client = OpenAI(
@@ -38,6 +39,7 @@ exam_client = OpenAI(api_key=EXAM_API_KEY, base_url=os.environ.get('EXAM_BASE_UR
 app = FastAPI()
 app.include_router(homework_router)
 app.include_router(platform_assistant_router)
+app.include_router(ai_writing_router)
 
 app.add_middleware(
     CORSMiddleware,
