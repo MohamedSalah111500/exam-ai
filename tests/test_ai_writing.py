@@ -55,15 +55,21 @@ def body(**overrides):
     return data
 
 
-def test_requires_the_service_key(api):
+def test_requires_the_service_key_when_one_is_configured(api):
     http, _ = api
     assert http.post("/ai-writing", json=body()).status_code == 401
     assert http.post("/ai-writing", json=body(), headers={"X-Service-Key": "wrong"}).status_code == 401
 
 
-def test_fails_closed_when_no_service_key_is_configured(api, monkeypatch):
+def test_is_open_when_no_service_key_is_configured(api, monkeypatch):
     http, _ = api
     monkeypatch.setattr(ai_writing, "_SERVICE_KEY", None)
+    assert http.post("/ai-writing", json=body()).status_code == 200
+
+
+def test_still_needs_the_model_to_be_configured(api, monkeypatch):
+    http, _ = api
+    monkeypatch.setattr(ai_writing, "_client", None)
     assert http.post("/ai-writing", json=body(), headers=HEADERS).status_code == 503
 
 
