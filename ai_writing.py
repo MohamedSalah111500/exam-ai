@@ -16,7 +16,11 @@ _client = OpenAI(api_key=_API_KEY, base_url=os.environ.get('WRITING_BASE_URL', '
 _SERVICE_KEY = os.environ.get('AI_SERVICE_KEY')
 
 MAX_TEXT_CHARS = 3000
-MAX_CONTEXT_CHARS = 300
+MAX_CONTEXT_CHARS = 600
+MAX_CONTEXT_FIELDS = 8
+MAX_LABEL_CHARS = 40
+MAX_PURPOSE_CHARS = 300
+MAX_FORMAT_CHARS = 300
 MAX_INSTRUCTIONS_CHARS = 300
 MAX_RESULT_CHARS = 3000
 MAX_RESULT_TOKENS = 900
@@ -29,14 +33,6 @@ ACTIONS = {
     "marketing": "Rewrite the text as an attractive, persuasive marketing text that makes the reader want to act, without inventing any facts.",
     "fix": "Fix spelling, grammar and punctuation only. Keep the wording, the meaning and the length as they are.",
     "generate": "Write the text from scratch using only the context given.",
-}
-
-TARGETS = {
-    "course-description": {
-        "purpose": "the DESCRIPTION of one online course on a teaching platform, written for prospective students",
-        "context": {"title": "COURSE TITLE", "shortDescription": "SHORT DESCRIPTION"},
-        "required": ["title"],
-    },
 }
 
 SYSTEM_PROMPT = (
@@ -62,8 +58,10 @@ SYSTEM_PROMPT = (
 
 
 class WritingRequest(BaseModel):
-    target: str
     action: str
+    purpose: str
+    format: Optional[str] = None
+    maxResultLength: Optional[int] = None
     text: Optional[str] = None
     context: Optional[Dict[str, str]] = None
     instructions: Optional[str] = None
@@ -80,10 +78,12 @@ def _clean(value: Optional[str], limit: int) -> str:
     return (value or "").strip()[:limit]
 
 
-def _build_message(profile: dict, action: str, text: str, context: Dict[str, str], instructions: str) -> str:
-    lines = [f"PURPOSE: {profile['purpose']}", f"TASK: {ACTIONS[action]}"]
-    for key, label in profile["context"].items():
-        lines.append(f"{label}: {_clean(context.get(key), MAX_CONTEXT_CHARS) or '-'}")
+def _build_message(purpose: str, fmt: str, action: str, text: str, context: Dict[str, str], instructions: str) -> str:
+    lines = [f"PURPOSE: {purpose}", f"TASK: {ACTIONS[action]}"]
+    for label, value in context.items():
+        lines.append(f"{label.upper()}: {value}")
+    if fmt:
+        lines.append(f"FORMAT: {fmt}")
     lines.append(f"CURRENT TEXT: {text or '-'}")
     lines.append(f"EXTRA INSTRUCTIONS: {instructions or '-'}")
     return "\n".join(lines)
@@ -95,23 +95,32 @@ def ai_writing(req: WritingRequest, x_service_key: Optional[str] = Header(defaul
     if _client is None:
         raise HTTPException(status_code=503, detail="AI_WRITING_NOT_CONFIGURED")
 
-    profile = TARGETS.get((req.target or "").strip().lower())
     action = (req.action or "").strip().lower()
-    if profile is None:
-        raise HTTPException(status_code=400, detail="INVALID_TARGET")
     if action not in ACTIONS:
         raise HTTPException(status_code=400, detail="INVALID_ACTION")
 
-    context = {k: (v or "").strip() for k, v in (req.context or {}).items() if k in profile["context"]}
-    if any(not context.get(field) for field in profile["required"]):
+    purpose = _clean(req.purpose, MAX_PURPOSE_CHARS)
+    if not purpose:
+        raise HTTPException(status_code=400, detail="PURPOSE_REQUIRED")
+
+    context = {}
+    for label, value in (req.context or {}).items():
+        label = _clean(label, MAX_LABEL_CHARS)
+        value = _clean(value, MAX_CONTEXT_CHARS)
+        if label and value:
+            context[label] = value
+    if len(context) > MAX_CONTEXT_FIELDS:
+        raise HTTPException(status_code=400, detail="TOO_MANY_CONTEXT_FIELDS")
+    if action == "generate" and not context:
         raise HTTPException(status_code=400, detail="CONTEXT_REQUIRED")
+
     text = _clean(req.text, MAX_TEXT_CHARS)
     if action != "generate" and not text:
         raise HTTPException(status_code=400, detail="TEXT_REQUIRED")
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _build_message(profile, action, text, context, _clean(req.instructions, MAX_INSTRUCTIONS_CHARS))},
+        {"role": "user", "content": _build_message(purpose, _clean(req.format, MAX_FORMAT_CHARS), action, text, context, _clean(req.instructions, MAX_INSTRUCTIONS_CHARS))},
     ]
 
     result = ""
@@ -135,4 +144,5 @@ def ai_writing(req: WritingRequest, x_service_key: Optional[str] = Header(defaul
     if not result:
         raise HTTPException(status_code=502, detail="AI_WRITING_FAILED" if failed else "EMPTY_RESULT")
 
-    return {"text": result[:MAX_RESULT_CHARS]}
+    limit = min(MAX_RESULT_CHARS, req.maxResultLength) if req.maxResultLength and req.maxResultLength > 0 else MAX_RESULT_CHARS
+    return {"text": result[:limit]}
