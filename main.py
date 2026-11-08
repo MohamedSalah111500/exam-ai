@@ -49,6 +49,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from service_auth import is_valid_service_token, service_secret
+
+_PUBLIC_PATHS = {"/health"}
+
+
+@app.middleware("http")
+async def require_service_token(request: Request, call_next):
+    secret = service_secret()
+    if secret and request.method != "OPTIONS" and request.url.path not in _PUBLIC_PATHS:
+        header = request.headers.get("authorization", "")
+        token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        if not token or not is_valid_service_token(token, secret):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 def _detect_upload_kind(data: bytes, filename: str, content_type: str) -> Optional[str]:
     """Return "pdf" / "docx" / None. Content bytes win over the filename, because
     non-ASCII names (e.g. Arabic) can arrive RFC 2047-encoded ("=?utf-8?B?...?=")
