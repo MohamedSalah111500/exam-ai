@@ -49,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from service_auth import is_valid_service_token, service_secret
+from service_auth import rejection_reason, service_secret
 
 _PUBLIC_PATHS = {"/health"}
 
@@ -60,7 +60,9 @@ async def require_service_token(request: Request, call_next):
     if secret and request.method != "OPTIONS" and request.url.path not in _PUBLIC_PATHS:
         header = request.headers.get("authorization", "")
         token = header[7:].strip() if header[:7].lower() == "bearer " else ""
-        if not token or not is_valid_service_token(token, secret):
+        reason = rejection_reason(token, secret)
+        if reason is not None:
+            print(f"[service-auth] 401 reason={reason} path={request.url.path} has_authorization={bool(header)}", flush=True)
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     return await call_next(request)
 
