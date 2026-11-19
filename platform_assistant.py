@@ -14,7 +14,7 @@ router = APIRouter()
 _API_KEY = os.environ.get('ASSISTANT_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
 _client = OpenAI(api_key=_API_KEY, base_url=os.environ.get('ASSISTANT_BASE_URL', 'https://api.deepseek.com')) if _API_KEY else None
 
-MAX_ANSWER_TOKENS = 400
+MAX_ANSWER_TOKENS = 800
 MAX_ANSWER_CHARS = 1200
 MAX_ATTEMPTS = 2
 TOUR_ID_PATTERN = re.compile(r'^[a-z0-9-]{1,64}$')
