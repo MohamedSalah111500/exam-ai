@@ -14,6 +14,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 
 from config import DEEPSEEK_MODEL
+from exam_generation import generate_questions, join_pages
 from homework import router as homework_router
 from platform_assistant import router as platform_assistant_router
 from ai_writing import router as ai_writing_router
@@ -116,7 +117,7 @@ async def generate_exam(
         try:
             if kind == "pdf":
                 pdf_reader = PyPDF2.PdfReader(io.BytesIO(contents))
-                source_text = "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
+                source_text = join_pages([page.extract_text() or "" for page in pdf_reader.pages])
             else:
                 source_text = docx2txt.process(io.BytesIO(contents)) or ""
         except Exception as e:
@@ -134,58 +135,25 @@ async def generate_exam(
     if not source_text.strip():
         raise HTTPException(status_code=400, detail="لم يتم العثور على محتوى لإنشاء الأسئلة.")
 
-    # 2. Refined Prompt for better mapping
-    instruction_notes = f"User Notes: {notes}" if notes else ""
-    
-    prompt = (
-        f"Generate exactly {question_count} MCQs based on this text: {source_text[:2000]}\n"
-        f"Language: {language}, Level: {level}. {instruction_notes}\n"
-        f"Return ONLY a JSON object with this structure:\n"
-        f"{{\n"
-        f"  \"questions\": [\n"
-        f"    {{\n"
-        f"      \"id\": \"1\",\n"
-        f"      \"questionHead\": \"Question text here\",\n"
-        f"      \"answers\": [\"A\", \"B\", \"C\", \"D\"],\n"
-        f"      \"correctAnswer\": 0\n"
-        f"    }}\n"
-        f"  ]\n"
-        f"}}"
-    )
+    if exam_client is None:
+        raise HTTPException(status_code=503, detail="EXAM_AI_NOT_CONFIGURED")
 
     try:
-        # 3. AI Request
-        response = exam_client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a professional teacher. Return valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={'type': 'json_object'},
-            temperature=0.3
-        )
-
-        response_content = response.choices[0].message.content.strip()
-        ai_data = json.loads(response_content)
-        
-        # Ensure we are passing the list of questions, not the whole object, 
-        # to match your frontend's 'questions' property
-        raw_questions = ai_data.get("questions", [])
-
-        # 4. Final Structure for Frontend Mapping
-        # This matches the "Exam" object structure your frontend likely expects
-        return {
-            "id": 0,
-            "name": f"اختبار {level} - {language}",
-            "isAutoCorrect": True,
-            "createdBy": 1,
-            "creationTime": datetime.now().isoformat(),
-            "questions": raw_questions,  # This list must contain objects with questionHead, answers, etc.
-            "isShowCorrectAnswers": True
-        }
-
+        result = generate_questions(exam_client, DEEPSEEK_MODEL, source_text, notes, question_count, language, level)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Mapping Error: {str(e)}")
+
+    return {
+        "id": 0,
+        "name": f"اختبار {level} - {language}",
+        "isAutoCorrect": True,
+        "createdBy": 1,
+        "creationTime": datetime.now().isoformat(),
+        "questions": result["questions"],
+        "isShowCorrectAnswers": True,
+        "mode": result["mode"],
+        "unverified": result["unverified"],
+    }
 
 
 # ----------------------------------------------------------------------
